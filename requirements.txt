@@ -1,0 +1,7 @@
+kurigram==2.2.24
+pymongo[srv]==4.17.0
+python-dotenv>=1.0.0
+tgcrypto>=1.2.5
+PyNaCl
+dnspython>=2.6.0
+parsett>=0.4.0
