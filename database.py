@@ -30,6 +30,7 @@ class AccountStatus(str, Enum):
 
 
 class JobStatus(str, Enum):
+    INDEXING = "indexing"
     PENDING = "pending"
     RUNNING = "running"
     PAUSED = "paused"
@@ -65,6 +66,7 @@ class Database:
         self.forward_jobs = None
         self.statistics = None
         self.job_logs = None
+        self.job_duplicate_index = None
         self.delete_configs = None
 
     async def connect(self) -> None:
@@ -91,9 +93,15 @@ class Database:
             self.forward_jobs = self.db["forward_jobs"]
             self.statistics = self.db["statistics"]
             self.job_logs = self.db["job_logs"]
+            self.job_duplicate_index = self.db["job_duplicate_index"]
             self.delete_configs = self.db["delete_configs"]
 
             await self._create_indexes()
+            try:
+                from core.db_resolver import ensure_indexes as ensure_user_db_indexes
+                await ensure_user_db_indexes()
+            except Exception:
+                logger.debug("user_db_config indexes skipped", exc_info=True)
             logger.info("✅ MongoDB connected successfully")
 
         except Exception as e:
@@ -154,6 +162,29 @@ class Database:
         # job_logs
         await self.job_logs.create_index([("job_id", ASCENDING)])
         await self.job_logs.create_index([("created_at", DESCENDING)])
+        # job-specific pre-index duplicates (separate from target anti-dupe)
+        # Per-target pre-index: same media can be dup in A but not in B
+        try:
+            await self.job_duplicate_index.drop_index("job_id_1_file_unique_id_1")
+        except Exception:
+            pass
+        try:
+            await self.job_duplicate_index.drop_index("job_file_unique")
+        except Exception:
+            pass
+        await self.job_duplicate_index.create_index(
+            [
+                ("job_id", ASCENDING),
+                ("target_chat_id", ASCENDING),
+                ("file_unique_id", ASCENDING),
+            ],
+            unique=True,
+            name="job_target_file_unique",
+        )
+        await self.job_duplicate_index.create_index([("job_id", ASCENDING)])
+        await self.job_duplicate_index.create_index(
+            [("job_id", ASCENDING), ("target_chat_id", ASCENDING)]
+        )
 
         # delete_configs (Delete Manager)
         await self.delete_configs.create_index([("user_id", ASCENDING)])
@@ -445,6 +476,113 @@ async def clear_duplicates(user_id: int, target_chat_id: int) -> int:
     return result.deleted_count
 
 
+
+# ============================================================
+# JOB PRE-INDEX DUPLICATES (job-scoped; independent of target anti-dupe)
+# ============================================================
+
+async def is_job_preindex_duplicate(
+    job_id: str,
+    file_unique_id: str,
+    target_chat_id: int = None,
+) -> bool:
+    """Per-target: same file can be duplicate in A but not in B."""
+    if not job_id or not file_unique_id or target_chat_id is None:
+        return False
+    doc = await db.job_duplicate_index.find_one({
+        "job_id": str(job_id),
+        "target_chat_id": int(target_chat_id),
+        "file_unique_id": str(file_unique_id),
+    })
+    return doc is not None
+
+
+async def mark_job_preindex_id(
+    job_id: str,
+    file_unique_id: str,
+    target_chat_id: int = None,
+    source_msg_id: int = None,
+) -> bool:
+    """Upsert per (job, target, file). True if newly inserted."""
+    if not job_id or not file_unique_id or target_chat_id is None:
+        return False
+    try:
+        await db.job_duplicate_index.update_one(
+            {
+                "job_id": str(job_id),
+                "target_chat_id": int(target_chat_id),
+                "file_unique_id": str(file_unique_id),
+            },
+            {
+                "$setOnInsert": {
+                    "job_id": str(job_id),
+                    "target_chat_id": int(target_chat_id),
+                    "file_unique_id": str(file_unique_id),
+                    "source_msg_id": source_msg_id,
+                    "indexed_at": datetime.now(timezone.utc),
+                }
+            },
+            upsert=True,
+        )
+        return True
+    except DuplicateKeyError:
+        return False
+    except Exception as e:
+        logger.error("mark_job_preindex_id: %s", e)
+        return False
+
+
+async def bulk_mark_job_preindex(job_id: str, items: list) -> int:
+    """items: dicts with file_unique_id + target_chat_id (required for per-target)."""
+    if not items:
+        return 0
+    from pymongo import UpdateOne
+    ops = []
+    now = datetime.now(timezone.utc)
+    for it in items:
+        fid = it.get("file_unique_id")
+        tid = it.get("target_chat_id")
+        if not fid or tid is None:
+            continue
+        tid = int(tid)
+        ops.append(
+            UpdateOne(
+                {
+                    "job_id": str(job_id),
+                    "target_chat_id": tid,
+                    "file_unique_id": str(fid),
+                },
+                {
+                    "$setOnInsert": {
+                        "job_id": str(job_id),
+                        "target_chat_id": tid,
+                        "file_unique_id": str(fid),
+                        "source_msg_id": it.get("source_msg_id"),
+                        "indexed_at": now,
+                    }
+                },
+                upsert=True,
+            )
+        )
+    if not ops:
+        return 0
+    try:
+        res = await db.job_duplicate_index.bulk_write(ops, ordered=False)
+        return int(getattr(res, "upserted_count", 0) or 0)
+    except Exception as e:
+        logger.error("bulk_mark_job_preindex: %s", e)
+        return 0
+
+
+async def clear_job_preindex(job_id: str) -> int:
+    res = await db.job_duplicate_index.delete_many({"job_id": str(job_id)})
+    return int(getattr(res, "deleted_count", 0) or 0)
+
+
+async def count_job_preindex(job_id: str) -> int:
+    return await db.job_duplicate_index.count_documents({"job_id": str(job_id)})
+
+
 async def get_duplicate_count(user_id: int, target_chat_id: int) -> int:
     return await db.duplicates.count_documents({
         "user_id": user_id,
@@ -462,7 +600,12 @@ async def add_forward_account(
     session_string: str,               # encrypted session
     name: Optional[str] = None,
     forward_limit: int = 500,
-    sleep_after_limit_minutes: int = 30
+    sleep_after_limit_minutes: int = 30,
+    *,
+    tg_user_id: Optional[int] = None,
+    username: Optional[str] = None,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Add a new user account.
@@ -485,11 +628,24 @@ async def add_forward_account(
         logger.exception("Session encrypt failed — refusing to store plaintext")
         raise
 
+    uname = (username or "").strip().lstrip("@") or None
+    fname = (first_name or "").strip() or None
+    lname = (last_name or "").strip() or None
+    display = (name or "").strip()
+    if not display:
+        display = " ".join(x for x in [fname or "", lname or ""] if x).strip()
+    if not display:
+        display = f"@{uname}" if uname else (phone or "Account")
+
     doc = {
         "user_id": user_id,
         "account_id": account_id,
         "phone": phone,
-        "name": name or phone,
+        "name": display,
+        "first_name": fname,
+        "last_name": lname,
+        "username": uname,
+        "tg_user_id": int(tg_user_id) if tg_user_id else None,
         "session_string": session_string,
         "status": AccountStatus.ACTIVE.value,
         "forward_limit": forward_limit,
@@ -767,6 +923,7 @@ async def create_job(
     skip: int = 0,
     initial_limit: Optional[int] = None,   # None = unlimited until last_msg_id
     future_new_posts: bool = False,
+    pre_index_target_duplicates: bool = False,
     account_strategy: str = AccountStrategy.SEQUENTIAL.value,
     name: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -788,9 +945,14 @@ async def create_job(
         "bot_id": bot_id,
         "last_msg_id": last_msg_id,
         "skip": skip,
-        "current_msg_id": skip,             # progress pointer
+        "current_msg_id": skip,             # progress within current target
+        "current_target_index": 0,       # which target_chat_ids index is active
         "initial_limit": initial_limit,
         "future_new_posts": future_new_posts,
+        "pre_index_target_duplicates": bool(pre_index_target_duplicates),
+        "pre_index_status": None,  # None|running|done|failed
+        "pre_index_error": None,
+        "pre_index_count": 0,
         "monitor_interval_seconds": 10,
         "last_monitor_at": None,
         "last_detected_msg_id": None,
@@ -840,7 +1002,7 @@ async def get_user_jobs(
 
 
 async def get_active_jobs(user_id: Optional[int] = None) -> List[Dict[str, Any]]:
-    query = {"status": {"$in": [JobStatus.RUNNING.value, JobStatus.PENDING.value]}}
+    query = {"status": {"$in": [JobStatus.RUNNING.value, JobStatus.PENDING.value, "indexing"]}}
     if user_id is not None:
         query["user_id"] = user_id
     return await db.forward_jobs.find(query).sort("created_at", 1).to_list(length=None)
@@ -877,6 +1039,179 @@ async def update_job_stats(
     return result.modified_count > 0
 
 
+async def record_job_forward_tick(
+    user_id: int,
+    job_id: str,
+    *,
+    current_msg_id: Optional[int] = None,
+    forwarded_delta: int = 1,
+    fetched_delta: int = 1,
+) -> None:
+    """
+    Record a successful forward for accurate Current / Average / Peak speed.
+
+    - recent_forward_ts: last ~120 timestamps (for current window rate)
+    - speed_active_seconds: sum of inter-forward gaps capped so long sleeps
+      do not crush average (gaps > 90s treated as idle, not counted)
+    - speed_peak_mpm: max observed current rate (msg/min)
+    """
+    now = datetime.now(timezone.utc)
+    now_ts = now.timestamp()
+    job = await get_job(user_id, job_id)
+    if not job:
+        return
+
+    last_ts = job.get("last_forward_ts")
+    active_extra = 0.0
+    if last_ts is not None:
+        try:
+            gap = float(now_ts) - float(last_ts)
+        except (TypeError, ValueError):
+            gap = 0.0
+        # Only count "active forwarding" time; ignore long sleeps/pauses
+        if 0 < gap <= 90.0:
+            active_extra = gap
+        elif gap > 90.0:
+            # first message after pause: small credit so avg doesn't spike
+            active_extra = min(2.0, gap)
+    else:
+        active_extra = 0.5  # first forward
+
+    recent = list(job.get("recent_forward_ts") or [])
+    recent.append(now_ts)
+    # keep ~2 minutes of samples, max 180 points
+    cutoff = now_ts - 120.0
+    recent = [t for t in recent if isinstance(t, (int, float)) and t >= cutoff][-180:]
+
+    window = 60.0
+    in_window = sum(1 for t in recent if t >= now_ts - window)
+    current_mpm = (in_window / window) * 60.0 if in_window else 0.0
+
+    prev_peak = float(job.get("speed_peak_mpm") or 0.0)
+    peak = max(prev_peak, current_mpm)
+
+    inc: Dict[str, Any] = {
+        "stats.forwarded": int(forwarded_delta),
+        "stats.fetched": int(fetched_delta),
+        "speed_active_seconds": float(active_extra),
+    }
+    set_fields: Dict[str, Any] = {
+        "updated_at": now,
+        "last_forward_ts": now_ts,
+        "last_forward_at": now,
+        "recent_forward_ts": recent,
+        "speed_current_mpm": round(current_mpm, 2),
+        "speed_peak_mpm": round(peak, 2),
+    }
+    if current_msg_id is not None:
+        set_fields["current_msg_id"] = int(current_msg_id)
+
+    await db.forward_jobs.update_one(
+        {"user_id": user_id, "job_id": job_id},
+        {"$inc": inc, "$set": set_fields},
+    )
+
+
+def compute_job_speed_eta(job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Accurate speed + ETA from job document.
+    Returns dict with current_mpm, avg_mpm, peak_mpm, eta_seconds, eta_label, runtime.
+    """
+    now = datetime.now(timezone.utc)
+    stats = job.get("stats") or {}
+    fwd = int(stats.get("forwarded") or 0)
+    status = (job.get("status") or "").lower()
+    last = int(job.get("last_msg_id") or 0)
+    skip = int(job.get("skip") or 0)
+    cur = int(job.get("current_msg_id") or skip or 0)
+    targets = list(job.get("target_chat_ids") or [])
+    t_idx = int(job.get("current_target_index") or 0)
+    n_t = max(1, len(targets) or 1)
+    future = bool(job.get("future_new_posts"))
+    monitoring = status == "running" and future and cur >= last
+
+    st = job.get("started_at")
+    if isinstance(st, datetime):
+        if st.tzinfo is None:
+            st = st.replace(tzinfo=timezone.utc)
+        end = job.get("completed_at") if status in ("completed", "cancelled", "failed") else now
+        if isinstance(end, datetime) and end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        if not isinstance(end, datetime):
+            end = now
+        runtime = max(0.0, (end - st).total_seconds())
+    else:
+        runtime = 0.0
+
+    # Current: prefer stored window rate; recompute from samples if present
+    now_ts = now.timestamp()
+    recent = [t for t in (job.get("recent_forward_ts") or []) if isinstance(t, (int, float))]
+    if recent:
+        in_w = sum(1 for t in recent if t >= now_ts - 60.0)
+        current_mpm = (in_w / 60.0) * 60.0
+    else:
+        current_mpm = float(job.get("speed_current_mpm") or 0.0)
+
+    # Average: active forwarding time only (excludes long account sleeps)
+    active = float(job.get("speed_active_seconds") or 0.0)
+    if active > 1.0 and fwd > 0:
+        avg_mpm = (fwd / active) * 60.0
+    elif runtime > 1.0 and fwd > 0:
+        avg_mpm = (fwd / runtime) * 60.0
+    else:
+        avg_mpm = 0.0
+
+    peak_mpm = float(job.get("speed_peak_mpm") or 0.0)
+    peak_mpm = max(peak_mpm, current_mpm, avg_mpm if avg_mpm < 500 else 0)
+
+    # Remaining work (message-ID units, multi-target aware)
+    range_span = max(0, last - skip)
+    remain_cur = max(0, last - cur)
+    remain_targets = max(0, n_t - t_idx - 1)
+    remain_units = remain_cur + remain_targets * range_span
+
+    # Rate for ETA: prefer current if enough samples, else average
+    samples = len([t for t in recent if t >= now_ts - 60.0]) if recent else 0
+    if samples >= 3 and current_mpm > 0.05:
+        rate_mpm = current_mpm
+        rate_source = "current"
+    elif avg_mpm > 0.05:
+        rate_mpm = avg_mpm
+        rate_source = "average"
+    else:
+        rate_mpm = 0.0
+        rate_source = "none"
+
+    eta_seconds = None
+    eta_label = "—"
+    if monitoring or status not in ("running", "indexing"):
+        eta_label = "—"
+    elif remain_units <= 0:
+        eta_label = "—"
+    elif rate_mpm <= 0 or fwd < 2:
+        eta_label = "Calculating…"
+    else:
+        eta_seconds = (remain_units / rate_mpm) * 60.0
+        # sanity cap
+        if eta_seconds > 86400 * 30:
+            eta_label = "Calculating…"
+            eta_seconds = None
+        else:
+            eta_label = None  # caller formats duration
+
+    return {
+        "current_mpm": round(current_mpm, 2),
+        "avg_mpm": round(avg_mpm, 2),
+        "peak_mpm": round(peak_mpm, 2),
+        "runtime": runtime,
+        "remain_units": remain_units,
+        "eta_seconds": eta_seconds,
+        "eta_label": eta_label,
+        "rate_source": rate_source,
+        "monitoring": monitoring,
+    }
+
+
 async def set_job_status(
     user_id: int,
     job_id: str,
@@ -905,6 +1240,10 @@ async def delete_job(user_id: int, job_id: str) -> bool:
     })
     if result.deleted_count > 0:
         await db.job_logs.delete_many({"job_id": job_id})
+        try:
+            await clear_job_preindex(job_id)
+        except Exception:
+            await db.job_duplicate_index.delete_many({"job_id": job_id})
         return True
     return False
 
@@ -928,15 +1267,71 @@ async def add_job_log(
     })
 
 
-async def get_job_logs(job_id: str, limit: int = 100) -> List[Dict[str, Any]]:
-    cursor = db.job_logs.find({"job_id": job_id}).sort("created_at", DESCENDING).limit(limit)
+async def get_job_logs(
+    job_id: str,
+    limit: int = 100,
+    *,
+    level: Optional[str] = None,
+    skip: int = 0,
+) -> List[Dict[str, Any]]:
+    q: Dict[str, Any] = {"job_id": job_id}
+    if level and level not in ("all", "*", ""):
+        q["level"] = level
+    cursor = (
+        db.job_logs.find(q)
+        .sort("created_at", DESCENDING)
+        .skip(max(0, int(skip)))
+        .limit(limit)
+    )
     return await cursor.to_list(length=None)
+
+
+async def count_job_logs(job_id: str, level: Optional[str] = None) -> int:
+    q: Dict[str, Any] = {"job_id": job_id}
+    if level and level not in ("all", "*", ""):
+        q["level"] = level
+    return int(await db.job_logs.count_documents(q))
 
 
 async def clear_job_logs(job_id: str) -> int:
     result = await db.job_logs.delete_many({"job_id": job_id})
     return int(result.deleted_count or 0)
 
+
+
+
+DEFAULT_PROGRESS_UI_INTERVAL = 5 * 60   # 5 minutes
+MIN_PROGRESS_UI_INTERVAL = 5 * 60        # 5 minutes (everyone)
+MAX_PROGRESS_UI_INTERVAL = 24 * 3600     # 1 day
+# Sub-5-minute only for owner/admin (optional fast refresh)
+OWNER_ONLY_PROGRESS_UI = {60, 120}  # 1m, 2m
+
+
+def job_progress_ui_interval(job) -> int:
+    """How often the open job progress message is auto-refreshed.
+
+    Everyone: 5m..1d. Owner/admin may store 1m or 2m (OWNER_ONLY_PROGRESS_UI).
+    """
+    try:
+        n = int((job or {}).get("progress_ui_interval_seconds") or DEFAULT_PROGRESS_UI_INTERVAL)
+    except (TypeError, ValueError):
+        n = DEFAULT_PROGRESS_UI_INTERVAL
+    if n in OWNER_ONLY_PROGRESS_UI:
+        return n
+    return max(MIN_PROGRESS_UI_INTERVAL, min(MAX_PROGRESS_UI_INTERVAL, n))
+
+
+def clamp_progress_ui_interval(raw, *, allow_fast: bool = False) -> int:
+    """Clamp interval. allow_fast=True keeps 1m/2m for owner/admin setters."""
+    try:
+        n = int(str(raw).strip())
+    except Exception:
+        n = DEFAULT_PROGRESS_UI_INTERVAL
+    if allow_fast and n in OWNER_ONLY_PROGRESS_UI:
+        return n
+    if n in OWNER_ONLY_PROGRESS_UI and not allow_fast:
+        return MIN_PROGRESS_UI_INTERVAL
+    return max(MIN_PROGRESS_UI_INTERVAL, min(MAX_PROGRESS_UI_INTERVAL, n))
 
 def job_monitor_interval(job: Optional[Dict[str, Any]]) -> int:
     """Persisted interval with safe default for old jobs. Max 10 days."""
@@ -1180,10 +1575,15 @@ async def set_index_db_uri(user_id: int, uri: Optional[str]) -> bool:
 async def get_index_db_uri_plain(user_id: int) -> Optional[str]:
     """Decrypt stored Index DB URI for connection. Never log result."""
     user = await get_user(user_id)
-    if not user or not user.get("index_db_uri"):
+    if user and user.get("index_db_uri"):
+        from core.security import decrypt_session
+        return decrypt_session(user["index_db_uri"])
+    try:
+        from core.db_resolver import resolve_feature_db
+        r = await resolve_feature_db(user_id, "indexing")
+        return r.get("uri")
+    except Exception:
         return None
-    from core.security import decrypt_session
-    return decrypt_session(user["index_db_uri"])
 
 
 async def set_index_bot_id(user_id: int, bot_id: Optional[str]) -> bool:
@@ -1229,10 +1629,15 @@ async def ensure_wroxen_indexes() -> None:
 
 async def get_wroxen_db_uri_plain(user_id: int) -> Optional[str]:
     user = await get_user(user_id)
-    if not user or not user.get("wroxen_db_uri"):
+    if user and user.get("wroxen_db_uri"):
+        from core.security import decrypt_session
+        return decrypt_session(user["wroxen_db_uri"])
+    try:
+        from core.db_resolver import resolve_feature_db
+        r = await resolve_feature_db(user_id, "wroxen")
+        return r.get("uri")
+    except Exception:
         return None
-    from core.security import decrypt_session
-    return decrypt_session(user["wroxen_db_uri"])
 
 
 async def set_wroxen_db_uri(user_id: int, uri: Optional[str]) -> bool:
@@ -1263,6 +1668,13 @@ async def create_wroxen_config(
     name: Optional[str] = None,
 ) -> Dict[str, Any]:
     await ensure_wroxen_indexes()
+    existing = await db.db["wroxen_configs"].find_one({
+        "user_id": int(user_id),
+        "source_chat_id": int(source_chat_id),
+        "target_chat_id": int(target_chat_id),
+    })
+    if existing:
+        return existing
     now = datetime.now(timezone.utc)
     wroxen_id = str(ObjectId())
     doc = {
@@ -1332,6 +1744,13 @@ async def create_delete_config(
     target_title: str,
     account_id: str,
 ) -> Dict[str, Any]:
+    # One delete config per user per target chat
+    existing = await db.delete_configs.find_one({
+        "user_id": int(user_id),
+        "target_chat_id": int(target_chat_id),
+    })
+    if existing:
+        return existing
     now = datetime.now(timezone.utc)
     cid = str(ObjectId())
     interval = 86400
