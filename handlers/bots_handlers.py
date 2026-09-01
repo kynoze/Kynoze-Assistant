@@ -41,17 +41,20 @@ async def _jobs_using_bot(user_id: int, bot_id: str) -> int:
 
 
 async def bot_detail_text(bot: dict, user_id: int) -> str:
+    from handlers.ui import format_bot_label
+
     name = bot.get("name") or bot.get("bot_username") or "Bot"
     status = bot.get("status", "active")
     total = bot.get("total_forwarded", 0)
     uname = bot.get("bot_username")
-    uname_s = f"@{uname}" if uname else "-"
+    uname_s = f"@{uname}" if uname else "—"
     icon = status_icon("active" if status == "active" else "disabled")
     jobs = await _jobs_using_bot(user_id, bot.get("bot_id"))
     connected = "🟢 Connected" if status == "active" else "⚪ Disabled"
     return (
-        f"**🤖 {name}**\n\n"
-        f"{uname_s}\n"
+        f"**🤖 {format_bot_label(bot, short=True)}**\n\n"
+        f"**Name:** {name}\n"
+        f"**Username:** {uname_s}\n"
         f"{HR}\n"
         f"**Status:** {icon} {connected}\n"
         f"**Jobs:** `{jobs}`\n"
@@ -76,13 +79,14 @@ async def show_bots_list(client: Client, query: CallbackQuery, page: int = 0):
         await safe_edit(query, text, bots_list_keyboard([]))
         return await safe_answer(query)
 
+    from handlers.ui import format_bot_label
+
     slice_, page, total_pages = paginate(bots, page)
-    lines = [f"**🤖 Forward Bots** ({len(bots)})\n"]
+    lines = [f"**🤖 My Bots** ({len(bots)})\n"]
     for b in slice_:
-        name = b.get("name") or b.get("bot_username") or "Bot"
-        uname = f" @{b['bot_username']}" if b.get("bot_username") else ""
+        label = format_bot_label(b, short=True)
         icon = status_icon("active" if b.get("status") == "active" else "disabled")
-        lines.append(f"{icon} **{name}**{uname}")
+        lines.append(f"{icon} **{label}**")
     kb = with_pager(bots_list_keyboard(slice_), "bot:listp:", page, total_pages)
     await safe_edit(query, "\n".join(lines), kb)
     await safe_answer(query)

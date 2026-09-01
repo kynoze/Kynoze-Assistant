@@ -99,7 +99,8 @@ async def _home_text(user_id: int) -> str:
     if bot_id:
         bot = await get_bot(user_id, bot_id)
         if bot:
-            name = bot.get("name") or bot.get("bot_username") or bot_id[:8]
+            from handlers.ui import format_bot_label
+            name = format_bot_label(bot, short=True) if bot else bot_id[:8]
             bot_line = f"🤖 {name}"
         else:
             bot_line = "⚠️ Bot missing (re-select)"
@@ -301,6 +302,45 @@ async def indexing_callbacks(client: Client, query: CallbackQuery):
         if not bot_client:
             await query.answer("Could not start Index Bot client", show_alert=True)
             return
+        # Source access: public can work without membership; private needs access/admin
+        try:
+            src = int(st["source_chat_id"])
+            chat = await bot_client.get_chat(src)
+            chat_type = str(getattr(chat, "type", "") or "").lower()
+            is_private_group = "private" in chat_type or chat_type in (
+                "chatttype.supergroup",
+                "chatttype.group",
+                "supergroup",
+                "group",
+            )
+            # If we can get_chat, bot already has some access. For restricted private, require admin.
+            if is_private_group:
+                try:
+                    mem = await bot_client.get_chat_member(src, "me")
+                    status = str(getattr(mem, "status", "") or "").lower()
+                    if "left" in status or "banned" in status:
+                        return await query.answer(
+                            "❌ Bot has no access to this private source chat.",
+                            show_alert=True,
+                        )
+                    # private: prefer admin for reliable history
+                    if "admin" not in status and "owner" not in status and "creator" not in status:
+                        # still allow if member and can read history — warn only for pure channels
+                        if "channel" in chat_type:
+                            return await query.answer(
+                                "❌ Bot must be admin in private channel source.",
+                                show_alert=True,
+                            )
+                except Exception as e:
+                    return await query.answer(
+                        f"❌ Cannot access source chat: {type(e).__name__}",
+                        show_alert=True,
+                    )
+        except Exception as e:
+            return await query.answer(
+                f"❌ Source access failed: {type(e).__name__}: {e}",
+                show_alert=True,
+            )
         set_state(client, "index_state", user_id, None)
         await safe_edit(
             query,
@@ -467,6 +507,36 @@ async def indexing_callbacks(client: Client, query: CallbackQuery):
         if not bot_client:
             await query.answer("Could not start Index Bot", show_alert=True)
             return
+        # Target permission: bot must be admin + can post
+        try:
+            from core.permissions import check_self_admin, has_privilege
+            for tid in selected:
+                ok, msg = await check_self_admin(bot_client, tid)
+                if not ok:
+                    return await query.answer(
+                        f"❌ Bot not admin in target `{tid}`: {msg}",
+                        show_alert=True,
+                    )
+                try:
+                    if not await has_privilege(bot_client, tid, "can_post_messages"):
+                        # groups use can_post_messages False often; try send
+                        mem = await bot_client.get_chat_member(tid, "me")
+                        priv = getattr(mem, "privileges", None)
+                        can_post = True
+                        if priv is not None and hasattr(priv, "can_post_messages"):
+                            if priv.can_post_messages is False:
+                                can_post = False
+                        if not can_post:
+                            return await query.answer(
+                                f"❌ Bot cannot post messages in target `{tid}`",
+                                show_alert=True,
+                            )
+                except Exception:
+                    pass
+        except Exception as e:
+            return await query.answer(
+                f"Permission check failed: {type(e).__name__}", show_alert=True
+            )
         set_state(client, "index_state", user_id, None)
         from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
         kb = InlineKeyboardMarkup([

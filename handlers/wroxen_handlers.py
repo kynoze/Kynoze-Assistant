@@ -108,7 +108,7 @@ async def show_wroxen_home(client: Client, query: CallbackQuery) -> None:
 @Client.on_callback_query(filters.regex(r"^wx:"))
 async def wroxen_callbacks(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
-    from core.access import can_access_bot
+    from core.access import can_access_bot, can_use_feature
     if not await can_access_bot(user_id):
         return await query.answer("Not allowed", show_alert=True)
     await ensure_user(user_id)
@@ -175,7 +175,8 @@ async def wroxen_callbacks(client: Client, query: CallbackQuery):
             await query.answer("Not found", show_alert=True)
             return
         bot = await get_bot(user_id, cfg["bot_id"])
-        bot_name = (bot.get("name") or bot.get("bot_username") or cfg["bot_id"][:8]) if bot else "?"
+        from handlers.ui import format_bot_label
+        bot_name = format_bot_label(bot, short=True) if bot else "?"
         uri = await get_wroxen_db_uri_plain(user_id)
         count = 0
         if uri:
@@ -311,7 +312,8 @@ async def wroxen_callbacks(client: Client, query: CallbackQuery):
             return await query.answer("Add a Forward Bot first", show_alert=True)
         rows = []
         for b in bots:
-            name = (b.get("name") or b.get("bot_username") or b["bot_id"])[:28]
+            from handlers.ui import format_bot_label
+            name = format_bot_label(b, short=True)[:40]
             rows.append([InlineKeyboardButton(f"🤖 {name}", callback_data=f"wx:addbot:{b['bot_id']}")])
         rows.append([InlineKeyboardButton("« Cancel", callback_data="wx:home")])
         set_state(client, "wroxen_state", user_id, {"step": "add_bot"})
@@ -385,6 +387,18 @@ async def _start_index_job(client: Client, query: CallbackQuery, user_id: int, s
     if not bot_client:
         return await query.answer("Could not start bot client", show_alert=True)
 
+    # Live Telegram permission checks (Management Bot admin NOT required)
+    try:
+        from core.permissions import verify_wroxen
+        sid = int(st["source_chat_id"])
+        tid = int(st["target_chat_id"])
+        perm_err = await verify_wroxen(user_id, str(bot_id), sid, tid)
+        if perm_err:
+            return await query.answer(perm_err, show_alert=True)
+    except Exception as e:
+        logger.exception("wroxen perm check")
+        return await query.answer(f"Permission check failed: {type(e).__name__}", show_alert=True)
+
     # create config if new
     wid = st.get("wroxen_id")
     if not wid:
@@ -436,11 +450,20 @@ async def wroxen_index_progress(client: Client, query: CallbackQuery):
         return
     if query.data == "wx:idx_stop":
         request_cancel(user_id)
+        text = format_live(user_id) or "🛑 Stop requested…"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Refresh", callback_data="wx:idx_prog")],
+            [InlineKeyboardButton("❌ Stop", callback_data="wx:idx_stop")],
+        ])
+        try:
+            await safe_edit(query, text, kb)
+        except Exception:
+            pass
         return await query.answer("Stop requested")
     if query.data == "wx:idx_prog":
         text = format_live(user_id)
         if not text:
-            return await query.answer("No active index", show_alert=True)
+            return await query.answer("No active index (finished or not started)", show_alert=True)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Refresh", callback_data="wx:idx_prog")],
             [InlineKeyboardButton("❌ Stop", callback_data="wx:idx_stop")],

@@ -59,6 +59,45 @@ def _unwrap_job(state):
 
 @Client.on_message(filters.private & filters.text & ~filters.command(["start", "targets", "cancel"]))
 async def handle_all_text_input(client: Client, message: Message):
+    from handlers.logchat_handlers import handle_log_chat_text
+    if await handle_log_chat_text(client, message):
+        return
+
+    # Job progress auto-update custom (minutes)
+    _uid = message.from_user.id if message.from_user else 0
+    pui = get_state(client, "job_progress_ui_state", _uid)
+    if pui and pui.get("job_id"):
+        from database import clamp_progress_ui_interval, update_job, OWNER_ONLY_PROGRESS_UI
+        from handlers.ui import fmt_interval
+        from core.access import is_owner, is_admin as access_is_admin
+        raw = (message.text or "").strip()
+        try:
+            minutes = int(raw)
+            raw_sec = minutes * 60
+        except Exception:
+            return await message.reply(
+                "Send minutes as a number. Example: `15` for 15 minutes.\n"
+                "Normal users: 5–1440. Owner/admin: 1–1440."
+            )
+        _priv = is_owner(_uid) or await access_is_admin(_uid)
+        if raw_sec in OWNER_ONLY_PROGRESS_UI and not _priv:
+            return await message.reply(
+                "1 min / 2 min only for owner & admins. Minimum **5 minutes** for others."
+            )
+        if raw_sec < 5 * 60 and not _priv:
+            return await message.reply(
+                "Minimum **5 minutes** for normal users. Owner/admin can use 1 or 2."
+            )
+        seconds = clamp_progress_ui_interval(raw_sec, allow_fast=_priv)
+        job_id = pui["job_id"]
+        await update_job(_uid, job_id, {"progress_ui_interval_seconds": seconds})
+        set_state(client, "job_progress_ui_state", _uid, None)
+        await message.reply(
+            f"✅ Progress auto-update set to **{fmt_interval(seconds)}** for this job."
+        )
+        return
+
+
     from handlers.cnl_handlers import handle_cnl_text
     if await handle_cnl_text(client, message):
         return
@@ -293,28 +332,38 @@ async def handle_all_text_input(client: Client, message: Message):
                     phone_code_hash=phone_code_hash,
                     phone_code=otp
                 )
+                me = await temp_client.get_me()
                 session_string = await temp_client.export_session_string()
                 await temp_client.disconnect()
                 from core.access import check_limit
-                from database import get_user_accounts
                 err = await check_limit(user_id, "accounts", len(await get_user_accounts(user_id)))
                 if err:
                     set_state(client, "account_add_state", user_id, None)
                     return await message.reply(err)
 
+                disp = " ".join(
+                    x for x in [(me.first_name or ""), (me.last_name or "")] if x
+                ).strip() or (f"@{me.username}" if me.username else phone)
                 result = await add_forward_account(
                     user_id=user_id,
                     phone=phone,
                     session_string=session_string,
-                    name=phone
+                    name=disp,
+                    tg_user_id=me.id,
+                    username=me.username,
+                    first_name=me.first_name,
+                    last_name=me.last_name,
                 )
                 set_state(client, "account_add_state", user_id, None)
                 if result is None:
                     return await message.reply("⚠️ This phone number is already added.")
+                uname_s = f"@{me.username}" if me.username else "—"
                 await message.reply(
                     f"✅ **Account Added Successfully!**\n\n"
-                    f"**Phone:** `{phone}`\n"
-                    f"**Account ID:** `{result['account_id']}`\n\n"
+                    f"**Name:** {disp}\n"
+                    f"**Username:** {uname_s}\n"
+                    f"**Telegram ID:** `{me.id}`\n"
+                    f"**Phone:** `{phone}`\n\n"
                     f"You can now use this account for forwarding jobs."
                 )
                 accounts = await get_user_accounts(user_id)
@@ -356,28 +405,38 @@ async def handle_all_text_input(client: Client, message: Message):
             phone = account_state["phone"]
             try:
                 await temp_client.check_password(password)
+                me = await temp_client.get_me()
                 session_string = await temp_client.export_session_string()
                 await temp_client.disconnect()
                 from core.access import check_limit
-                from database import get_user_accounts
                 err = await check_limit(user_id, "accounts", len(await get_user_accounts(user_id)))
                 if err:
                     set_state(client, "account_add_state", user_id, None)
                     return await message.reply(err)
 
+                disp = " ".join(
+                    x for x in [(me.first_name or ""), (me.last_name or "")] if x
+                ).strip() or (f"@{me.username}" if me.username else phone)
                 result = await add_forward_account(
                     user_id=user_id,
                     phone=phone,
                     session_string=session_string,
-                    name=phone
+                    name=disp,
+                    tg_user_id=me.id,
+                    username=me.username,
+                    first_name=me.first_name,
+                    last_name=me.last_name,
                 )
                 set_state(client, "account_add_state", user_id, None)
                 if result is None:
                     return await message.reply("⚠️ This phone number is already added.")
+                uname_s = f"@{me.username}" if me.username else "—"
                 await message.reply(
                     f"✅ **Account Added Successfully (with 2FA)!**\n\n"
-                    f"**Phone:** `{phone}`\n"
-                    f"**Account ID:** `{result['account_id']}`"
+                    f"**Name:** {disp}\n"
+                    f"**Username:** {uname_s}\n"
+                    f"**Telegram ID:** `{me.id}`\n"
+                    f"**Phone:** `{phone}`"
                 )
                 accounts = await get_user_accounts(user_id)
                 await message.reply(
@@ -391,49 +450,89 @@ async def handle_all_text_input(client: Client, message: Message):
     add_state = get_state(client, "target_add_state", user_id)
     if add_state:
         try:
-            if text.startswith("@"):
-                chat = await client.get_chat(text)
-            else:
-                chat_id = int(text)
-                chat = await client.get_chat(chat_id)
+            chat = None
+            raw = text.strip()
+            try:
+                if raw.startswith("@"):
+                    chat = await client.get_chat(raw)
+                elif raw.startswith("https://t.me/") or raw.startswith("t.me/"):
+                    chat = await client.get_chat(raw)
+                else:
+                    chat_id = int(raw)
+                    try:
+                        chat = await client.get_chat(chat_id)
+                    except Exception:
+                        # common: user pasted public channel id without -100 prefix
+                        if chat_id > 0:
+                            try:
+                                chat = await client.get_chat(int(f"-100{chat_id}"))
+                            except Exception:
+                                raise
+                        else:
+                            raise
+            except Exception as e:
+                return await message.reply(
+                    "❌ Could not resolve that chat from this message.\n\n"
+                    "• Prefer **@username** or invite link\n"
+                    "• Raw IDs only work if a client already knows the peer\n"
+                    "• Management Bot does **not** need to be admin\n"
+                    f"• Error: `{type(e).__name__}`"
+                )
 
             if chat.type not in [ChatType.CHANNEL, ChatType.SUPERGROUP, ChatType.GROUP]:
                 return await message.reply("❌ Only Channels and Groups are supported.")
 
             from core.access import check_limit
-            from database import get_user_targets
             err = await check_limit(user_id, "targets", len(await get_user_targets(user_id)))
             if err:
                 set_state(client, "target_add_state", user_id, None)
                 return await message.reply(err)
 
-            result = await add_target(
-                user_id=user_id,
-                chat_id=chat.id,
-                title=chat.title or "Unknown",
-                username=getattr(chat, "username", None)
-            )
-            set_state(client, "target_add_state", user_id, None)
-            if result is None:
-                return await message.reply("⚠️ This target is already added.")
+            bots = await get_user_bots(user_id)
+            accs = await get_user_accounts(user_id)
+            if not bots and not accs:
+                set_state(client, "target_add_state", user_id, None)
+                return await message.reply(
+                    "❌ Add at least one Bot or User Account before adding a Target Chat."
+                )
+
+            # Management Bot is NOT required as admin — verify via selected bot/account
+            set_state(client, "target_add_state", user_id, {
+                "step": "pick_executor",
+                "chat_id": chat.id,
+                "title": chat.title or "Unknown",
+                "username": getattr(chat, "username", None),
+            })
+            from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+            rows = []
+            for b in bots[:15]:
+                name = b.get("bot_username") or b.get("name") or b.get("bot_id") or "?"
+                bid = str(b.get("bot_id") or "")
+                rows.append([InlineKeyboardButton(
+                    f"🤖 {name}", callback_data=f"tg:exec:bot:{bid}"
+                )])
+            for a in accs[:15]:
+                name = a.get("name") or a.get("phone") or a.get("account_id") or "?"
+                aid = str(a.get("account_id") or "")
+                rows.append([InlineKeyboardButton(
+                    f"👤 {name}", callback_data=f"tg:exec:acc:{aid}"
+                )])
+            rows.append([InlineKeyboardButton("« Cancel", callback_data="tg:list")])
             await message.reply(
-                f"✅ **Target Added Successfully!**\n\n"
-                f"**Name:** {chat.title}\n"
-                f"**ID:** `{chat.id}`"
-            )
-            targets = await get_user_targets(user_id)
-            await message.reply(
-                f"**🎯 Your Targets** ({len(targets)})",
-                reply_markup=targets_list_keyboard(targets)
+                f"**Select execution identity to verify**\n\n"
+                f"Chat: **{chat.title}** (`{chat.id}`)\n\n"
+                f"Management Bot does **not** need to be admin.\n"
+                f"Pick the Bot or Account that is admin in this chat.",
+                reply_markup=InlineKeyboardMarkup(rows),
             )
         except ValueError:
             await message.reply("❌ Invalid Chat ID. Please send a valid number or @username.")
         except Exception as e:
             await message.reply(
                 friendly_error("add target", e) + "\n\n"
-                "Make sure:\n"
-                "• Bot is **Admin** in that channel/group\n"
-                "• You sent correct Chat ID or @username"
+                "Tips:\n"
+                "• Prefer @username or invite link if the chat is private\n"
+                "• You will verify via your My Bot / My Account (Management Bot admin not required)"
             )
         return
 
@@ -462,7 +561,6 @@ async def handle_all_text_input(client: Client, message: Message):
             bot_username = me.username
             bot_name = me.first_name or "Forward Bot"
             from core.access import check_limit
-            from database import get_user_bots
             err = await check_limit(user_id, "bots", len(await get_user_bots(user_id)))
             if err:
                 set_state(client, "bot_add_state", user_id, None)

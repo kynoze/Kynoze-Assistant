@@ -80,10 +80,12 @@ MIN_AGE = 86400
 
 
 async def _acc_name(user_id: int, account_id: str) -> str:
+    from handlers.ui import format_account_label
+
     acc = await get_account(user_id, account_id)
     if not acc:
         return "—"
-    return acc.get("name") or acc.get("phone") or account_id[:8]
+    return format_account_label(acc, short=True)
 
 
 def _types_summary(cfg: dict) -> str:
@@ -224,10 +226,12 @@ async def pick_group_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 
 async def pick_account_keyboard(user_id: int, prefix: str) -> InlineKeyboardMarkup:
-    accounts = await get_user_accounts(user_id)
+    from handlers.ui import active_accounts_only
+    accounts = active_accounts_only(await get_user_accounts(user_id))
     rows = []
     for a in accounts:
-        name = (a.get("name") or a.get("phone") or "Account")[:24]
+        from handlers.ui import format_account_label
+        name = format_account_label(a, short=True)[:24]
         st = a.get("status", "active")
         icon = {"active": "🟢", "sleeping": "😴", "disabled": "🔴", "error": "⚠️"}.get(st, "⚪")
         rows.append(
@@ -278,7 +282,8 @@ async def delete_callbacks(client: Client, query: CallbackQuery):
         return await safe_answer(query)
 
     if data == "dm:add":
-        accounts = await get_user_accounts(user_id)
+        from handlers.ui import active_accounts_only
+        accounts = active_accounts_only(await get_user_accounts(user_id))
         if not accounts:
             return await safe_answer(
                 query, "Add a forwarding User Account first (Accounts → Add).", True
@@ -334,7 +339,7 @@ async def delete_callbacks(client: Client, query: CallbackQuery):
                 fail_keyboard(),
             )
             return
-        ok, reason = await check_delete_permissions(ub, chat_id, (acc or {}).get("name"))
+        ok, reason = await check_delete_permissions(ub, chat_id, (acc or {}).get("name"), m_user_id=user_id)
         if not ok:
             await safe_edit(
                 query,
@@ -381,7 +386,7 @@ async def delete_callbacks(client: Client, query: CallbackQuery):
                     fail_keyboard(cid),
                 )
                 return await safe_answer(query)
-            ok, reason = await check_delete_permissions(ub, cfg["target_chat_id"])
+            ok, reason = await check_delete_permissions(ub, cfg["target_chat_id"], m_user_id=user_id)
             if not ok:
                 await safe_edit(
                     query,
@@ -446,7 +451,7 @@ async def delete_callbacks(client: Client, query: CallbackQuery):
                 fail_keyboard(cid),
             )
             return
-        ok, reason = await check_delete_permissions(ub, cfg["target_chat_id"])
+        ok, reason = await check_delete_permissions(ub, cfg["target_chat_id"], m_user_id=user_id)
         if not ok:
             await safe_edit(
                 query,
@@ -803,7 +808,7 @@ async def delete_callbacks(client: Client, query: CallbackQuery):
                 fail_keyboard(cid),
             )
             return
-        ok, reason = await check_delete_permissions(ub, cfg["target_chat_id"])
+        ok, reason = await check_delete_permissions(ub, cfg["target_chat_id"], m_user_id=user_id)
         if not ok:
             await safe_edit(
                 query,

@@ -46,6 +46,8 @@ def dashboard_keyboard(allowed: dict | None = None, *, is_owner: bool = False) -
         buttons.append(row)
 
     buttons.append([InlineKeyboardButton("🗄️ My Databases", callback_data="dash:mydbs")])
+    buttons.append([InlineKeyboardButton("🩺 Runtime Health", callback_data="health:home")])
+    buttons.append([InlineKeyboardButton("📢 Log Chat", callback_data="log:home")])
     buttons.append([InlineKeyboardButton("🗄️ My Storage", callback_data="dash:storage")])
     if is_owner:
         buttons.append([InlineKeyboardButton("👑 Owner Control", callback_data="own:home")])
@@ -227,9 +229,11 @@ def confirm_delete_keyboard(chat_id: int) -> InlineKeyboardMarkup:
 # ============================================================
 
 def accounts_list_keyboard(accounts: List[Dict]) -> InlineKeyboardMarkup:
+    from handlers.ui import format_account_label
+
     buttons = []
     for acc in accounts:
-        name = (acc.get("name") or acc.get("phone") or "Unknown")[:25]
+        name = format_account_label(acc, short=True)[:40]
         status = acc.get("status", "active")
         status_icon = {
             "active": "🟢",
@@ -313,9 +317,11 @@ def confirm_delete_account_keyboard(account_id: str) -> InlineKeyboardMarkup:
 # ============================================================
 
 def bots_list_keyboard(bots: List[Dict]) -> InlineKeyboardMarkup:
+    from handlers.ui import format_bot_label
+
     buttons = []
     for b in bots:
-        name = (b.get("name") or b.get("bot_username") or "Bot")[:25]
+        name = format_bot_label(b, short=True)[:40]
         status = b.get("status", "active")
         icon = "🟢" if status == "active" else "🔴"
 
@@ -375,7 +381,11 @@ def confirm_delete_bot_keyboard(bot_id: str) -> InlineKeyboardMarkup:
 # JOBS
 # ============================================================
 
-def jobs_list_keyboard(jobs: List[Dict]) -> InlineKeyboardMarkup:
+def jobs_list_keyboard(
+    jobs: List[Dict],
+    *,
+    status_filter: str = "all",
+) -> InlineKeyboardMarkup:
     buttons = []
     for j in jobs:
         name = (j.get("name") or f"Job {j['job_id'][:6]}")[:28]
@@ -386,7 +396,8 @@ def jobs_list_keyboard(jobs: List[Dict]) -> InlineKeyboardMarkup:
             "paused": "⏸",
             "completed": "✅",
             "cancelled": "🛑",
-            "failed": "❌"
+            "failed": "❌",
+            "indexing": "🔍",
         }.get(status, "⚪")
 
         buttons.append([
@@ -396,9 +407,16 @@ def jobs_list_keyboard(jobs: List[Dict]) -> InlineKeyboardMarkup:
             )
         ])
 
+    sf = (status_filter or "all").lower()
+    buttons.append([
+        InlineKeyboardButton("•All" if sf == "all" else "All", callback_data="job:list:all"),
+        InlineKeyboardButton("•Run" if sf == "running" else "Run", callback_data="job:list:running"),
+        InlineKeyboardButton("•Pause" if sf == "paused" else "Pause", callback_data="job:list:paused"),
+        InlineKeyboardButton("•Done" if sf == "completed" else "Done", callback_data="job:list:completed"),
+    ])
     buttons.append([
         InlineKeyboardButton("➕ Create Job", callback_data="job:create"),
-        InlineKeyboardButton("🔄 Refresh", callback_data="job:list")
+        InlineKeyboardButton("🔄 Refresh", callback_data=f"job:list:{sf}"),
     ])
     buttons.append([
         InlineKeyboardButton("« Back to Dashboard", callback_data="dash:home")
@@ -476,15 +494,28 @@ def select_method_keyboard() -> InlineKeyboardMarkup:
 
 
 def select_accounts_keyboard(accounts: List[Dict], selected: List[str]) -> InlineKeyboardMarkup:
+    from handlers.ui import format_account_label, active_accounts_only
+
     buttons = []
-    for acc in accounts:
-        name = (acc.get("name") or acc.get("phone") or "Account")[:25]
+    for acc in active_accounts_only(accounts):
+        name = format_account_label(acc, short=True)[:40]
         acc_id = acc["account_id"]
         mark = "✅" if acc_id in selected else "⬜"
         buttons.append([
             InlineKeyboardButton(
                 f"{mark} {name}",
                 callback_data=f"jobcreate:toggle_account:{acc_id}"
+            )
+        ])
+    if not any(
+        (b[0].callback_data or "").startswith("jobcreate:toggle_account:")
+        for b in buttons
+        if b
+    ):
+        buttons.append([
+            InlineKeyboardButton(
+                "No active accounts — enable in My Accounts",
+                callback_data="acc:list",
             )
         ])
 
@@ -498,9 +529,11 @@ def select_accounts_keyboard(accounts: List[Dict], selected: List[str]) -> Inlin
 
 
 def select_bot_keyboard(bots: List[Dict]) -> InlineKeyboardMarkup:
+    from handlers.ui import format_bot_label
+
     buttons = []
     for b in bots:
-        name = (b.get("name") or b.get("bot_username") or "Bot")[:25]
+        name = format_bot_label(b, short=True)[:40]
         buttons.append([
             InlineKeyboardButton(
                 f"🤖 {name}",
@@ -650,12 +683,49 @@ def job_interval_keyboard(job: Dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def job_logs_keyboard(job_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Refresh", callback_data=f"job:logs:{job_id}")],
-        [InlineKeyboardButton("🗑 Clear Logs", callback_data=f"job:logsclear:{job_id}")],
-        [InlineKeyboardButton("« Job", callback_data=f"job:open:{job_id}")],
-    ])
+def job_logs_keyboard(
+    job_id: str,
+    *,
+    level: str = "all",
+    page: int = 0,
+    has_next: bool = False,
+) -> InlineKeyboardMarkup:
+    lvl = (level or "all").lower()
+    rows = [
+        [
+            InlineKeyboardButton(
+                ("• ALL" if lvl == "all" else "ALL"),
+                callback_data=f"job:logs:{job_id}:all:0",
+            ),
+            InlineKeyboardButton(
+                ("• ERR" if lvl == "error" else "ERR"),
+                callback_data=f"job:logs:{job_id}:error:0",
+            ),
+            InlineKeyboardButton(
+                ("• INFO" if lvl == "info" else "INFO"),
+                callback_data=f"job:logs:{job_id}:info:0",
+            ),
+            InlineKeyboardButton(
+                ("• WARN" if lvl == "warning" else "WARN"),
+                callback_data=f"job:logs:{job_id}:warning:0",
+            ),
+        ]
+    ]
+    nav = []
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton("⬅️ Prev", callback_data=f"job:logs:{job_id}:{lvl}:{page - 1}")
+        )
+    if has_next:
+        nav.append(
+            InlineKeyboardButton("Next ➡️", callback_data=f"job:logs:{job_id}:{lvl}:{page + 1}")
+        )
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data=f"job:logs:{job_id}:{lvl}:{page}")])
+    rows.append([InlineKeyboardButton("🗑 Clear Logs", callback_data=f"job:logsclear:{job_id}")])
+    rows.append([InlineKeyboardButton("« Job", callback_data=f"job:open:{job_id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ============================================================

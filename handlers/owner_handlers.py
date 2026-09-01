@@ -23,46 +23,67 @@ def _owner_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📏 Normal Limits", callback_data="own:nu:limits")],
         [InlineKeyboardButton("👮 Admins", callback_data="own:admins")],
         [InlineKeyboardButton("🗄️ Bot Storage", callback_data="own:storage")],
+        [InlineKeyboardButton("🗄️ User Databases", callback_data="own:dbs")],
+        [InlineKeyboardButton("🛡️ CNL Dupe TTL", callback_data="own:cnlttl")],
+        [InlineKeyboardButton("📢 Owner Log Chat", callback_data="own:log")],
         [InlineKeyboardButton("« Dashboard", callback_data="dash:home")],
     ])
 
 
 async def show_user_storage(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
-    from database import get_user_bots, get_user_accounts, get_user_targets
+    from database import get_user_bots, get_user_accounts, get_user_targets, db
     bots = await get_user_bots(user_id)
     accs = await get_user_accounts(user_id)
     targets = await get_user_targets(user_id)
-    # jobs count if available
     jobs_n = 0
     try:
-        from database import db
-        jobs_n = await db.db["jobs"].count_documents({"user_id": user_id})
+        jobs_n = await db.db["forward_jobs"].count_documents({"user_id": user_id})
     except Exception:
         pass
     cnl_rules = 0
     try:
         from core.cnl.db import get_cnl
         cnl = await get_cnl(user_id)
-        if cnl:
+        if cnl and hasattr(cnl, "get_rules_by_owner"):
             rules = await cnl.get_rules_by_owner(user_id)
+            cnl_rules = len(rules or [])
+        elif cnl:
+            rules = await cnl.forward_rules.find({"owner_id": int(user_id)}).to_list(500)
             cnl_rules = len(rules)
+    except Exception:
+        pass
+    # Per-user document counts (not whole-DB bytes)
+    my_lines = []
+    try:
+        from core.db_resolver import get_user_data_counts, FEATURES as DB_FEATURES
+        for feat in DB_FEATURES:
+            c = await get_user_data_counts(user_id, feat)
+            if c.get("total_docs"):
+                my_lines.append(f"• `{feat}`: `{c['total_docs']}` docs ({c.get('source')})")
     except Exception:
         pass
     text = (
         f"**🗄️ My Storage**\n\n"
-        f"🤖 My Bots: `{len(bots)}`\n"
-        f"👤 My Accounts: `{len(accs)}`\n"
-        f"🎯 Targets: `{len(targets)}`\n"
-        f"📋 Jobs: `{jobs_n}`\n"
+        f"**My resources**\n"
+        f"🤖 Bots: `{len(bots)}` · 👤 Accounts: `{len(accs)}`\n"
+        f"🎯 Targets: `{len(targets)}` · 📋 Jobs: `{jobs_n}`\n"
         f"📡 CNL Rules: `{cnl_rules}`\n"
+    )
+    if my_lines:
+        text += "\n**My data (document counts)**\n" + "\n".join(my_lines) + "\n"
+    text += (
+        "\n_Note: MongoDB byte size is per-database, not per-user. "
+        "Use My Databases → Storage for whole-DB size._"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🗑 Clear My Jobs", callback_data="stor:clear:jobs")],
+        [InlineKeyboardButton("🗄️ My Databases", callback_data="dash:mydbs")],
         [InlineKeyboardButton("« Dashboard", callback_data="dash:home")],
     ])
     await safe_edit(query, text, kb)
     await safe_answer(query)
+
 
 
 @Client.on_callback_query(filters.regex(r"^stor:"))
@@ -81,7 +102,7 @@ async def storage_callbacks(client: Client, query: CallbackQuery):
     if data == "stor:clear:jobs:yes":
         try:
             from database import db
-            res = await db.db["jobs"].delete_many({"user_id": user_id})
+            res = await db.db["forward_jobs"].delete_many({"user_id": user_id})
             await query.answer(f"Deleted {res.deleted_count} jobs")
         except Exception as e:
             await query.answer(f"Error: {e}", show_alert=True)
@@ -108,6 +129,27 @@ async def owner_callbacks(client: Client, query: CallbackQuery):
         await safe_edit(query, text, _owner_kb())
         return await safe_answer(query)
 
+    if data == "own:log" or data.startswith("own:log:"):
+        from handlers.logchat_handlers import show_owner_log_chat, _prompt_set
+        from core.log_chat import set_owner_log_chat, get_owner_log_chat, _send
+        if data == "own:log":
+            return await show_owner_log_chat(client, query)
+        if data == "own:log:set":
+            return await _prompt_set(client, query, owner=True)
+        if data == "own:log:rm":
+            await set_owner_log_chat(None)
+            await query.answer("Owner log chat removed")
+            return await show_owner_log_chat(client, query)
+        if data == "own:log:test":
+            info = await get_owner_log_chat()
+            if not info:
+                return await query.answer("Set owner log chat first", show_alert=True)
+            ok, err = await _send(
+                info["chat_id"],
+                "✅ **Owner log chat test**\n\nErrors and warnings will be posted here.",
+            )
+            return await query.answer("Test sent" if ok else err[:180], show_alert=not ok)
+
     if data == "own:nu:tog":
         s = await get_system_settings()
         new_v = not s.get("normal_users_enabled", False)
@@ -117,6 +159,7 @@ async def owner_callbacks(client: Client, query: CallbackQuery):
         return await owner_callbacks(client, query)
 
     if data == "own:nu:feats" or data.startswith("own:nu:feat:"):
+        from core.access import FEATURES as ACCESS_FEATURES
         s = await get_system_settings()
         feats = dict(s.get("normal_user_features") or DEFAULT_NORMAL_FEATURES)
         if data.startswith("own:nu:feat:"):
@@ -127,7 +170,7 @@ async def owner_callbacks(client: Client, query: CallbackQuery):
                 s = await get_system_settings()
                 feats = dict(s.get("normal_user_features") or {})
         rows = []
-        for k in FEATURES:
+        for k in ACCESS_FEATURES:
             on = feats.get(k, False)
             rows.append([InlineKeyboardButton(
                 f"{'✅' if on else '❌'} {k}",
@@ -189,14 +232,114 @@ async def owner_callbacks(client: Client, query: CallbackQuery):
 
     if data == "own:storage":
         from database import db
-        names = await db.db.list_collection_names()
-        lines = ["**🗄️ Bot Storage**\n"]
-        for n in sorted(names):
+        from core.db_resolver import mask_uri
+        from config import Config
+        lines = ["**🗄️ Bot Databases — Main**\n"]
+        try:
+            st = await db.client[Config.DB_NAME].command("dbStats")
+            names = await db.db.list_collection_names()
+            lines.append(f"DB: `{Config.DB_NAME}`")
+            lines.append(f"URI: `{mask_uri(Config.MONGO_URI)}`")
+            lines.append(f"Storage: `{st.get('storageSize', '—')}` bytes")
+            lines.append(f"Data: `{st.get('dataSize', '—')}` · Index: `{st.get('indexSize', '—')}`")
+            lines.append(f"Collections: `{len(names)}` · Docs: `{st.get('objects', '—')}`\n")
+        except Exception:
+            lines.append("⚠️ Storage information unavailable\n")
+        for n in sorted(await db.db.list_collection_names()):
             try:
-                c = await db.db[n].count_documents({})
+                c = await db.db[n].estimated_document_count()
             except Exception:
                 c = "?"
             lines.append(f"`{n}`: {c}")
+        await safe_edit(query, "\n".join(lines)[:3500], InlineKeyboardMarkup([
+            [InlineKeyboardButton("👤 User DBs", callback_data="own:dbs")],
+            [InlineKeyboardButton("« Owner", callback_data="own:home")],
+        ]))
+        return await safe_answer(query)
+
+
+    if data == "own:cnlttl" or data.startswith("own:cnlttl:"):
+        from core.cnl.constants import DEFAULT_DUPE_TTL_DAYS
+        s = await get_system_settings()
+        cur = s.get("cnl_default_dupe_ttl_days", DEFAULT_DUPE_TTL_DAYS)
+        if data.startswith("own:cnlttl:set:"):
+            val = data.split(":")[-1]
+            days = 0 if val == "off" else int(val)
+            await update_system_settings({"cnl_default_dupe_ttl_days": days})
+            try:
+                from core.cnl.db import _INSTANCES
+                for inst in list(_INSTANCES.values()):
+                    if getattr(inst, "is_connected", False):
+                        await inst._ensure_default_hash_ttl()
+            except Exception:
+                pass
+            cur = days
+            await query.answer(("TTL %s days" % days) if days else "TTL disabled")
+        text = (
+            "**🛡️ CNL Default Anti-Dupe TTL**\n\n"
+            "Applies only when user has **no Custom Dupe DB**.\n"
+            "Custom Dupe DB hashes stay permanent.\n\n"
+            f"Current: **{cur} days**" + (" (off)" if int(cur or 0) == 0 else "")
+        )
+        rows = [
+            [InlineKeyboardButton("7d", callback_data="own:cnlttl:set:7"),
+             InlineKeyboardButton("30d", callback_data="own:cnlttl:set:30"),
+             InlineKeyboardButton("60d", callback_data="own:cnlttl:set:60")],
+            [InlineKeyboardButton("90d", callback_data="own:cnlttl:set:90"),
+             InlineKeyboardButton("180d", callback_data="own:cnlttl:set:180"),
+             InlineKeyboardButton("Off", callback_data="own:cnlttl:set:off")],
+            [InlineKeyboardButton("« Owner", callback_data="own:home")],
+        ]
+        await safe_edit(query, text, InlineKeyboardMarkup(rows))
+        return await safe_answer(query)
+
+
+    if data == "own:dbs":
+        from core.db_resolver import (
+            list_all_user_db_configs, resolve_feature_db, get_storage_stats,
+            get_user_data_counts, FEATURES as DB_FEATURES, ping_resolved,
+        )
+        docs = await list_all_user_db_configs(50)
+        lines = ["**🗄️ User Databases**\n(credentials hidden)\n"]
+        if not docs:
+            lines.append("No user DB configs yet.")
+        for d in docs[:30]:
+            uid = d.get("user_id")
+            gname = d.get("global_db_name") or "—"
+            has_g = bool(d.get("global_uri_encrypted"))
+            feats = d.get("features") or {}
+            custom = [k for k, v in feats.items() if (v or {}).get("uri_encrypted")]
+            lines.append(f"• **user `{uid}`**")
+            if has_g:
+                try:
+                    r = await resolve_feature_db(int(uid), "cnl")
+                    st = await get_storage_stats(int(uid), "cnl") if r.get("source") == "global" else {}
+                    status = await ping_resolved(r) if r.get("uri") else "—"
+                    lines.append(
+                        f"  Global: `{gname}` · status `{status}`"
+                    )
+                    if st.get("ok"):
+                        lines.append(
+                            f"  DB size: `{st.get('storage')}` · cols `{st.get('collections')}` · docs `{st.get('documents')}`"
+                        )
+                except Exception:
+                    lines.append(f"  Global: `{gname}`")
+            else:
+                lines.append("  Global: —")
+            if custom:
+                lines.append(f"  Custom: {', '.join(custom)}")
+            # my data counts sample
+            try:
+                parts = []
+                for feat in ("wroxen", "indexing", "cnl"):
+                    c = await get_user_data_counts(int(uid), feat)
+                    if c.get("total_docs"):
+                        parts.append(f"{feat}:{c['total_docs']}")
+                if parts:
+                    lines.append(f"  My docs: {', '.join(parts)}")
+            except Exception:
+                pass
+            lines.append("")
         await safe_edit(query, "\n".join(lines)[:3500], InlineKeyboardMarkup([
             [InlineKeyboardButton("« Owner", callback_data="own:home")],
         ]))
@@ -301,3 +444,37 @@ async def cmd_rmadmin(client: Client, message: Message):
     from database import db
     await db.db["bot_admins"].delete_one({"user_id": uid})
     await message.reply(f"✅ Admin `{uid}` removed.")
+
+
+@Client.on_message(filters.private & filters.command("ban"))
+async def cmd_ban(client: Client, message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        return await message.reply("Usage: `/ban <user_id>`")
+    uid = int(parts[1])
+    from database import db
+    await db.db["bot_settings"].update_one(
+        {"_id": "main"},
+        {"$addToSet": {"banned_user_ids": uid}},
+        upsert=True,
+    )
+    await message.reply(f"🚫 User `{uid}` banned from the bot.")
+
+
+@Client.on_message(filters.private & filters.command("unban"))
+async def cmd_unban(client: Client, message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        return await message.reply("Usage: `/unban <user_id>`")
+    uid = int(parts[1])
+    from database import db
+    await db.db["bot_settings"].update_one(
+        {"_id": "main"},
+        {"$pull": {"banned_user_ids": uid}},
+        upsert=True,
+    )
+    await message.reply(f"✅ User `{uid}` unbanned.")

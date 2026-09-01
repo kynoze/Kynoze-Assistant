@@ -17,7 +17,7 @@ from handlers.keyboards import (
     target_detail_keyboard,
     confirm_delete_keyboard,
 )
-from core.state import set_state
+from core.state import set_state, get_state
 from handlers.ui import (
     HR,
     on_off,
@@ -150,15 +150,82 @@ async def target_callbacks(client: Client, query: CallbackQuery):
         return
 
     if data == "tg:add":
+        from database import get_user_bots, get_user_accounts
+        bots = await get_user_bots(user_id)
+        from handlers.ui import active_accounts_only
+        accs = active_accounts_only(await get_user_accounts(user_id))
+        if not bots and not accs:
+            return await query.answer(
+                "❌ Add at least one Bot or User Account before adding a Target Chat.",
+                show_alert=True,
+            )
         await safe_edit(
             query,
             "**➕ Add New Target**\n\n"
-            "Send me the **Channel / Group ID** or **Username**.\n\n"
+            "Send the **Channel / Group ID** or **Username**.\n\n"
+            "Management Bot does **not** need to be admin.\n"
+            "After the chat ID, you will select a **Bot** or **Account** to verify permissions.\n\n"
             "Example:\n`-1001234567890`  or  `@mychannel`\n\n"
             "Type /cancel to cancel.",
         )
-        set_state(client, "target_add_state", user_id, True)
+        set_state(client, "target_add_state", user_id, {"step": "await_chat"})
         return await safe_answer(query)
+
+
+    if data.startswith("tg:exec:bot:"):
+        bot_id = data.split(":")[-1]
+        st = get_state(client, "target_add_state", user_id) or {}
+        if not isinstance(st, dict) or st.get("step") != "pick_executor":
+            return await query.answer("Session expired — start Add Target again", show_alert=True)
+        chat_id = st.get("chat_id")
+        title = st.get("title") or str(chat_id)
+        username = st.get("username")
+        from core.permissions import verify_target_executor
+        from database import add_target, get_user_targets
+        err = await verify_target_executor(user_id, int(chat_id), bot_id=str(bot_id))
+        if err:
+            return await query.answer(err, show_alert=True)
+        result = await add_target(
+            user_id=user_id, chat_id=int(chat_id), title=title, username=username
+        )
+        set_state(client, "target_add_state", user_id, None)
+        if result is None:
+            return await query.answer("Already added", show_alert=True)
+        await safe_edit(
+            query,
+            f"✅ **Target Added**\n\n**Name:** {title}\n**ID:** `{chat_id}`\n"
+            f"Verified via bot `{bot_id}`",
+            targets_list_keyboard(await get_user_targets(user_id)),
+        )
+        return await safe_answer(query)
+
+    if data.startswith("tg:exec:acc:"):
+        acc_id = data.split(":")[-1]
+        st = get_state(client, "target_add_state", user_id) or {}
+        if not isinstance(st, dict) or st.get("step") != "pick_executor":
+            return await query.answer("Session expired — start Add Target again", show_alert=True)
+        chat_id = st.get("chat_id")
+        title = st.get("title") or str(chat_id)
+        username = st.get("username")
+        from core.permissions import verify_target_executor
+        from database import add_target, get_user_targets
+        err = await verify_target_executor(user_id, int(chat_id), account_id=str(acc_id))
+        if err:
+            return await query.answer(err, show_alert=True)
+        result = await add_target(
+            user_id=user_id, chat_id=int(chat_id), title=title, username=username
+        )
+        set_state(client, "target_add_state", user_id, None)
+        if result is None:
+            return await query.answer("Already added", show_alert=True)
+        await safe_edit(
+            query,
+            f"✅ **Target Added**\n\n**Name:** {title}\n**ID:** `{chat_id}`\n"
+            f"Verified via account `{acc_id}`",
+            targets_list_keyboard(await get_user_targets(user_id)),
+        )
+        return await safe_answer(query)
+
 
     if data.startswith("tg:open:"):
         chat_id = int(data.split(":")[2])

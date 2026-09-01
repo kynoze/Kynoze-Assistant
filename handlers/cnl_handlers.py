@@ -4,7 +4,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
+import logging
 from pyrogram import Client, filters
+logger = logging.getLogger(__name__)
 from pyrogram.types import (
     CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
     InlineQuery, InlineQueryResultArticle, InputTextMessageContent, Message,
@@ -41,10 +43,8 @@ def _kb_home(configured: bool) -> InlineKeyboardMarkup:
         rows += [
             [InlineKeyboardButton("📋 Rules", callback_data="cnl:rules"),
              InlineKeyboardButton("➕ Add Rule", callback_data="cnl:addrule")],
-            [InlineKeyboardButton("🤖 Bot", callback_data="cnl:bot"),
-             InlineKeyboardButton("👤 Account", callback_data="cnl:account")],
             [InlineKeyboardButton("📋 Global Copy", callback_data="cnl:gcopy"),
-             InlineKeyboardButton("🔒 Dupe DB", callback_data="cnl:dupe")],
+             InlineKeyboardButton("🛡️ Anti-Dupe", callback_data="cnl:dupe")],
             [InlineKeyboardButton("📊 Stats / Quota", callback_data="cnl:stats")],
             [InlineKeyboardButton("🗄 Database", callback_data="cnl:db")],
         ]
@@ -97,15 +97,55 @@ def _fmt_buttons(btns) -> str:
     return "\n".join(lines) or "_(none)_"
 
 
-def _rule_summary(rule: Dict[str, Any]) -> str:
+async def _via_label(user_id: int, rule: Dict[str, Any]) -> str:
+    """Human label for the executor used by this rule."""
+    via = (rule.get("forward_via") or "user_bot").lower()
+    from database import get_bot, get_account
+    from handlers.ui import format_bot_label, format_account_label
+    if via == "user_bot":
+        bid = str(rule.get("my_bot_id") or rule.get("exec_bot_id") or "")
+        if not bid:
+            return "🤖 User Bot — _(not selected)_"
+        bot = await get_bot(user_id, bid)
+        if not bot:
+            return f"🤖 User Bot — missing (`{bid[:12]}`)"
+        return f"🤖 {format_bot_label(bot, short=False)}"
+    aid = str(rule.get("my_account_id") or rule.get("exec_account_id") or "")
+    if not aid:
+        return "👤 User Account — _(not selected)_"
+    acc = await get_account(user_id, aid)
+    if not acc:
+        return f"👤 User Account — missing (`{aid[:12]}`)"
+    # name + @username, else name + telegram id
+    name = (acc.get("name") or acc.get("first_name") or "").strip()
+    last = (acc.get("last_name") or "").strip()
+    if name and last and last not in name:
+        name = f"{name} {last}".strip()
+    uname = (acc.get("username") or "").strip().lstrip("@")
+    tg_id = acc.get("tg_user_id") or acc.get("telegram_id")
+    if name and uname:
+        label = f"{name} · @{uname}"
+    elif uname:
+        label = f"@{uname}"
+    elif name and tg_id:
+        label = f"{name} · `{tg_id}`"
+    elif tg_id:
+        label = f"ID `{tg_id}`"
+    else:
+        label = format_account_label(acc, short=False)
+    return f"👤 {label}"
+
+
+async def _rule_summary(user_id: int, rule: Dict[str, Any]) -> str:
     sid, tid = rule["source_chat_id"], rule["target_chat_id"]
     en = rule.get("enabled", True)
     types = rule.get("allowed_types") or ["all"]
+    via_line = await _via_label(user_id, rule)
     lines = [
         f"**⚙️ Rule Settings**",
         f"`{sid}` → `{tid}`",
         f"Status: {'✅ Enabled' if en else '⏸ Disabled'}",
-        f"Via: `{rule.get('forward_via') or 'user_bot'}`",
+        f"**Forward Via:** {via_line}",
         f"Types: `{', '.join(types)}`",
         f"Delay: `{rule.get('delay') or 0}s`",
         f"Anti-dupe: {'ON' if rule.get('anti_dupe') else 'OFF'}",
@@ -206,11 +246,11 @@ async def _show_rule(client, query, user_id, sid, tid):
     if not cnl:
         await safe_edit(query, NOT_CONFIGURED, _kb_home(False))
         return
-    rule = await cnl.get_forward_rule(sid, tid)
+    rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id)
     if not rule:
         await query.answer("Rule not found", show_alert=True)
         return
-    await safe_edit(query, _rule_summary(rule), _rule_settings_kb(rule))
+    await safe_edit(query, await _rule_summary(user_id, rule), _rule_settings_kb(rule))
 
 
 # ── callbacks ───────────────────────────────────────────────────────────────
@@ -218,9 +258,11 @@ async def _show_rule(client, query, user_id, sid, tid):
 @Client.on_callback_query(filters.regex(r"^cnl:"))
 async def cnl_callbacks(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
-    from core.access import can_access_bot
+    from core.access import can_access_bot, can_use_feature
     if not await can_access_bot(user_id):
         return await query.answer("Not allowed", show_alert=True)
+    if not await can_use_feature(user_id, "cnl"):
+        return await query.answer("CNL is not enabled for your account", show_alert=True)
     data = query.data
 
     # ── via (add rule step 3) ──
@@ -235,31 +277,144 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         cnl = await get_cnl(user_id)
         if not cnl:
             return await query.answer("CNL not configured", show_alert=True)
-        from core.cnl.helpers import check_user_bot_permissions, check_user_account_permissions
-        err = await (check_user_bot_permissions if via == "user_bot" else check_user_account_permissions)(
-            user_id, sid, tid
-        )
-        if err:
-            return await query.answer(err, show_alert=True)
+        # One bot/account per rule — pick from My Bots / My Accounts
+        state["pending_via"] = via
+        set_state(client, CNL_STATE, user_id, state)
+        if via == "user_bot":
+            from database import get_user_bots
+            bots = await get_user_bots(user_id)
+            if not bots:
+                return await query.answer("Add a bot under My Bots first", show_alert=True)
+            rows = []
+            for b in bots[:20]:
+                from handlers.ui import format_bot_label
+                name = format_bot_label(b, short=True)
+                bid = str(b.get("bot_id") or "")
+                rows.append([InlineKeyboardButton(
+                    f"🤖 {name}",
+                    callback_data=f"cnl:addrule:pickbot:{bid}",
+                )])
+            rows.append([InlineKeyboardButton("« Cancel", callback_data="cnl:home")])
+            await safe_edit(
+                query,
+                f"**Step 3b — Select ONE My Bot for this rule**\n\n"
+                f"`{sid}` → `{tid}`\n"
+                f"Only this bot will forward for this rule.",
+                InlineKeyboardMarkup(rows),
+            )
+            return await safe_answer(query)
+        else:
+            from database import get_user_accounts
+            from handlers.ui import active_accounts_only
+            accs = active_accounts_only(await get_user_accounts(user_id))
+            if not accs:
+                return await query.answer("Add an account under My Accounts first", show_alert=True)
+            rows = []
+            for a in accs[:20]:
+                from handlers.ui import format_account_label
+                name = format_account_label(a, short=True)
+                aid = str(a.get("account_id") or "")
+                rows.append([InlineKeyboardButton(
+                    f"👤 {name}",
+                    callback_data=f"cnl:addrule:pickacc:{aid}",
+                )])
+            rows.append([InlineKeyboardButton("« Cancel", callback_data="cnl:home")])
+            await safe_edit(
+                query,
+                f"**Step 3b — Select ONE My Account for this rule**\n\n"
+                f"`{sid}` → `{tid}`",
+                InlineKeyboardMarkup(rows),
+            )
+            return await safe_answer(query)
+
+
+    if data.startswith("cnl:addrule:pickbot:"):
+        bot_id = data.split(":")[-1]
+        state = get_state(client, CNL_STATE, user_id) or {}
+        sid, tid = state.get("source_id"), state.get("target_id")
+        if not sid or not tid:
+            return await query.answer("Session expired — Add Rule again", show_alert=True)
+        cnl = await get_cnl(user_id)
+        if not cnl:
+            return await query.answer("CNL not configured", show_alert=True)
+        from core.permissions import verify_cnl_bot_rule
+        perm_err = await verify_cnl_bot_rule(user_id, str(bot_id), int(sid), int(tid))
+        if perm_err:
+            return await query.answer(perm_err, show_alert=True)
         from core.access import check_limit
-        rules = await cnl.get_user_rules(user_id) if hasattr(cnl, "get_user_rules") else []
         try:
-            if not rules:
-                rules = await cnl.forward_rules.find({"owner_id": int(user_id)}).to_list(500)
+            rules = await cnl.forward_rules.find({"owner_id": int(user_id)}).to_list(500)
         except Exception:
-            rules = rules or []
+            rules = []
         _err = await check_limit(user_id, "cnl_rules", len(rules))
         if _err:
             return await query.answer(_err, show_alert=True)
-        await cnl.create_forward_rule(sid, tid, user_id, forward_via=via, enabled=True)
+        await cnl.create_forward_rule(
+            sid, tid, user_id,
+            forward_via="user_bot",
+            my_bot_id=str(bot_id),
+            enabled=True,
+        )
+        from core.lifecycle import on_cnl_rule_saved
+        ok, msg = await on_cnl_rule_saved(user_id, {
+            "source_chat_id": sid, "target_chat_id": tid,
+            "forward_via": "user_bot", "my_bot_id": str(bot_id), "enabled": True,
+        })
+        if not ok:
+            logger.warning("CNL auto-start bot failed: %s", msg)
         set_state(client, CNL_STATE, user_id, None)
         await safe_edit(
             query,
-            f"✅ Rule created: `{sid}` → `{tid}` via `{via}`",
+            f"✅ Rule created\n`{sid}` → `{tid}`\nVia: **My Bot** `{bot_id}`\n\n"
+            f"One bot only for this rule.",
             InlineKeyboardMarkup([
                 [InlineKeyboardButton("⚙️ Open Rule", callback_data=f"cnl:rule:{sid}:{tid}")],
                 [InlineKeyboardButton("📋 Rules", callback_data="cnl:rules")],
-                [InlineKeyboardButton("« Home", callback_data="cnl:home")],
+            ]),
+        )
+        return await safe_answer(query)
+
+    if data.startswith("cnl:addrule:pickacc:"):
+        acc_id = data.split(":")[-1]
+        state = get_state(client, CNL_STATE, user_id) or {}
+        sid, tid = state.get("source_id"), state.get("target_id")
+        if not sid or not tid:
+            return await query.answer("Session expired — Add Rule again", show_alert=True)
+        cnl = await get_cnl(user_id)
+        if not cnl:
+            return await query.answer("CNL not configured", show_alert=True)
+        from core.permissions import verify_cnl_account_rule
+        perm_err = await verify_cnl_account_rule(user_id, str(acc_id), int(sid), int(tid))
+        if perm_err:
+            return await query.answer(perm_err, show_alert=True)
+        from core.access import check_limit
+        try:
+            rules = await cnl.forward_rules.find({"owner_id": int(user_id)}).to_list(500)
+        except Exception:
+            rules = []
+        _err = await check_limit(user_id, "cnl_rules", len(rules))
+        if _err:
+            return await query.answer(_err, show_alert=True)
+        await cnl.create_forward_rule(
+            sid, tid, user_id,
+            forward_via="user_account",
+            my_account_id=str(acc_id),
+            enabled=True,
+        )
+        from core.lifecycle import on_cnl_rule_saved
+        ok, msg = await on_cnl_rule_saved(user_id, {
+            "source_chat_id": sid, "target_chat_id": tid,
+            "forward_via": "user_account", "my_account_id": str(acc_id), "enabled": True,
+        })
+        if not ok:
+            logger.warning("CNL auto-start account failed: %s", msg)
+        set_state(client, CNL_STATE, user_id, None)
+        await safe_edit(
+            query,
+            f"✅ Rule created\n`{sid}` → `{tid}`\nVia: **My Account** `{acc_id}`",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚙️ Open Rule", callback_data=f"cnl:rule:{sid}:{tid}")],
+                [InlineKeyboardButton("📋 Rules", callback_data="cnl:rules")],
             ]),
         )
         return await safe_answer(query)
@@ -307,8 +462,38 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         await safe_edit(query, "✅ CNL database removed.", _kb_home(False))
         return await safe_answer(query)
 
+    # ── Delete all rules (BEFORE cnl:rules: page handler) ──
+    if data == "cnl:rules:delall":
+        await safe_edit(query,
+            "⚠️ **Delete ALL rules?**\nThis cannot be undone.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, delete all", callback_data="cnl:rules:delall:yes")],
+                [InlineKeyboardButton("❌ Cancel", callback_data="cnl:rules")],
+            ]))
+        return await safe_answer(query)
+
+    if data == "cnl:rules:delall:yes":
+        cnl = await get_cnl(user_id)
+        n = 0
+        if cnl:
+            try:
+                n = await cnl.delete_all_rules_of_user(user_id)
+            except Exception:
+                rules = await cnl.get_rules_by_owner(user_id)
+                await cnl.forward_rules.delete_many({"owner_id": int(user_id)})
+                n = len(rules)
+            try:
+                from core.lifecycle import reconcile_cnl_user
+                await reconcile_cnl_user(user_id)
+            except Exception:
+                pass
+        await query.answer(f"Deleted {n if isinstance(n, int) else 'all'} rules", show_alert=True)
+        query.data = "cnl:rules"
+        return await cnl_callbacks(client, query)
+
     # ── Rules list ──
-    if data == "cnl:rules" or data.startswith("cnl:rules:"):
+    if data == "cnl:rules" or (data.startswith("cnl:rules:") and "delall" not in data):
+
         page = 0
         if data.startswith("cnl:rules:"):
             try:
@@ -356,23 +541,6 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         await safe_edit(query, text, kb)
         return await safe_answer(query)
 
-    if data == "cnl:rules:delall":
-        await safe_edit(query,
-            "⚠️ **Delete ALL rules?**\nThis cannot be undone.",
-            InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Yes, delete all", callback_data="cnl:rules:delall:yes")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="cnl:rules")],
-            ]))
-        return await safe_answer(query)
-
-    if data == "cnl:rules:delall:yes":
-        cnl = await get_cnl(user_id)
-        if cnl:
-            await cnl.delete_all_rules_of_user(user_id)
-        await query.answer("All rules deleted")
-        query.data = "cnl:rules"
-        return await cnl_callbacks(client, query)
-
     if data == "cnl:addrule":
         cnl = await get_cnl(user_id)
         if not cnl:
@@ -402,9 +570,19 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         _, _, sid, tid = data.split(":")
         sid, tid = int(sid), int(tid)
         cnl = await get_cnl(user_id)
-        rule = await cnl.get_forward_rule(sid, tid) if cnl else None
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id) if cnl else None
         if rule:
-            await cnl.set_rule_enabled(sid, tid, not rule.get("enabled", True))
+            new_en = not rule.get("enabled", True)
+            await cnl.set_rule_enabled(sid, tid, new_en, owner_id=user_id)
+            rule = dict(rule)
+            rule["enabled"] = new_en
+            from core.lifecycle import on_cnl_rule_saved, on_cnl_rule_disabled
+            if new_en:
+                ok, msg = await on_cnl_rule_saved(user_id, rule)
+                if not ok:
+                    await query.answer(f"Enabled but client start failed: {msg}", show_alert=True)
+            else:
+                await on_cnl_rule_disabled(user_id, rule)
         await _show_rule(client, query, user_id, sid, tid)
         return await safe_answer(query)
 
@@ -412,9 +590,9 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         _, _, sid, tid = data.split(":")
         sid, tid = int(sid), int(tid)
         cnl = await get_cnl(user_id)
-        rule = await cnl.get_forward_rule(sid, tid) if cnl else None
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id) if cnl else None
         if rule:
-            await cnl.set_remove_links(sid, tid, not rule.get("remove_links", False))
+            await cnl.set_remove_links(sid, tid, not rule.get("remove_links", False), owner_id=user_id)
         await _show_rule(client, query, user_id, sid, tid)
         return await safe_answer(query)
 
@@ -422,46 +600,222 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         _, _, sid, tid = data.split(":")
         sid, tid = int(sid), int(tid)
         cnl = await get_cnl(user_id)
-        rule = await cnl.get_forward_rule(sid, tid) if cnl else None
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id) if cnl else None
         if rule:
-            await cnl.set_forward_tag(sid, tid, not rule.get("forward_tag", False))
+            await cnl.set_forward_tag(sid, tid, not rule.get("forward_tag", False), owner_id=user_id)
         await _show_rule(client, query, user_id, sid, tid)
         return await safe_answer(query)
 
-    # ── forward via ──
-    if data.startswith("cnl:rvia:"):
-        parts = data.split(":")
-        sid, tid = int(parts[2]), int(parts[3])
-        if len(parts) == 4:
+    # ── forward via: sid/tid live only in state (Telegram 64-byte limit) ──
+    if data.startswith("cnl:rv:") or data.startswith("cnl:rvp:") or data.startswith("cnl:rvia:"):
+        # Open from rule: cnl:rvia:<sid>:<tid>
+        if data.startswith("cnl:rvia:"):
+            parts = data.split(":")
+            if len(parts) < 4:
+                return await safe_answer(query)
+            try:
+                sid, tid = int(parts[2]), int(parts[3])
+            except Exception:
+                return await query.answer("Invalid rule", show_alert=True)
+            set_state(client, "cnl_rvia_state", user_id, {"sid": sid, "tid": tid})
+            data = "cnl:rv:menu"
+
+        pick = get_state(client, "cnl_rvia_state", user_id) or {}
+        sid, tid = pick.get("sid"), pick.get("tid")
+
+        # Pick bot/account by index: cnl:rvp:b:0 / cnl:rvp:a:0
+        if data.startswith("cnl:rvp:"):
+            parts = data.split(":")
+            if len(parts) < 4 or sid is None or tid is None:
+                try:
+                    await query.answer("Selection expired — open Forward Via again", show_alert=True)
+                except Exception:
+                    pass
+                return
+            kind, idx_s = parts[2], parts[3]
+            try:
+                idx = int(idx_s)
+            except Exception:
+                try:
+                    await query.answer("Invalid", show_alert=True)
+                except Exception:
+                    pass
+                return
+            ids = list(pick.get("ids") or [])
+            if idx < 0 or idx >= len(ids):
+                try:
+                    await query.answer("Selection expired — open Forward Via again", show_alert=True)
+                except Exception:
+                    pass
+                return
+            chosen = str(ids[idx])
+            # Answer immediately — long permission/start work can expire query id
+            try:
+                await query.answer("Saving…")
+            except Exception:
+                pass
             cnl = await get_cnl(user_id)
-            rule = await cnl.get_forward_rule(sid, tid) if cnl else None
-            cur = (rule or {}).get("forward_via") or "user_bot"
-            text = f"**🚀 Forward Via**\n\nCurrent: `{cur}`\n\nChoose method:"
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    ("✅ " if cur == "user_bot" else "") + "🤖 User Bot",
-                    callback_data=f"cnl:rvia:{sid}:{tid}:bot")],
-                [InlineKeyboardButton(
-                    ("✅ " if cur == "user_account" else "") + "👤 User Account",
-                    callback_data=f"cnl:rvia:{sid}:{tid}:acc")],
-                [InlineKeyboardButton("« Back", callback_data=_rule_back(sid, tid))],
-            ])
-            await safe_edit(query, text, kb)
-            return await safe_answer(query)
-        via = "user_bot" if parts[4] == "bot" else "user_account"
-        cnl = await get_cnl(user_id)
-        if cnl:
-            await cnl.update_forward_rule(sid, tid, {"forward_via": via})
-        await query.answer(f"Via set to {via}")
-        await _show_rule(client, query, user_id, sid, tid)
-        return await safe_answer(query)
+            if not cnl:
+                await _show_rule(client, query, user_id, int(sid), int(tid))
+                return
+            from core.lifecycle import on_cnl_rule_disabled, on_cnl_rule_saved
+            old = await cnl.get_forward_rule(int(sid), int(tid), owner_id=user_id) or {}
+            note = "Saved"
+            try:
+                if kind == "b":
+                    from core.permissions import verify_cnl_bot_rule
+                    perm_err = await verify_cnl_bot_rule(user_id, chosen, int(sid), int(tid))
+                    if perm_err:
+                        # keep state so user can try another bot
+                        await safe_edit(
+                            query,
+                            f"❌ **Permission failed**\n\n{perm_err}\n\nPick another bot or go back.",
+                            InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="cnl:rv:menu")]]),
+                        )
+                        return
+                    if old:
+                        await on_cnl_rule_disabled(user_id, old)
+                    await cnl.update_forward_rule(int(sid), int(tid), {
+                        "forward_via": "user_bot", "my_bot_id": chosen, "my_account_id": None,
+                    }, owner_id=user_id)
+                    rule = await cnl.get_forward_rule(int(sid), int(tid), owner_id=user_id) or {
+                        "source_chat_id": int(sid), "target_chat_id": int(tid),
+                        "forward_via": "user_bot", "my_bot_id": chosen, "enabled": True,
+                    }
+                    ok, msg = await on_cnl_rule_saved(user_id, rule)
+                    note = "Bot set" if ok else f"Set but start failed: {msg}"
+                elif kind == "a":
+                    from core.permissions import verify_cnl_account_rule
+                    perm_err = await verify_cnl_account_rule(user_id, chosen, int(sid), int(tid))
+                    if perm_err:
+                        await safe_edit(
+                            query,
+                            f"❌ **Permission failed**\n\n{perm_err}\n\nPick another account or go back.",
+                            InlineKeyboardMarkup([[InlineKeyboardButton("« Back", callback_data="cnl:rv:menu")]]),
+                        )
+                        return
+                    if old:
+                        await on_cnl_rule_disabled(user_id, old)
+                    await cnl.update_forward_rule(int(sid), int(tid), {
+                        "forward_via": "user_account", "my_account_id": chosen, "my_bot_id": None,
+                    }, owner_id=user_id)
+                    rule = await cnl.get_forward_rule(int(sid), int(tid), owner_id=user_id) or {
+                        "source_chat_id": int(sid), "target_chat_id": int(tid),
+                        "forward_via": "user_account", "my_account_id": chosen, "enabled": True,
+                    }
+                    ok, msg = await on_cnl_rule_saved(user_id, rule)
+                    note = "Account set" if ok else f"Set but start failed: {msg}"
+                else:
+                    await _show_rule(client, query, user_id, int(sid), int(tid))
+                    return
+            except Exception as e:
+                logger.exception("cnl rvia pick failed")
+                note = f"Error: {type(e).__name__}"
+            # Keep sid/tid in state only for menu; clear pick ids
+            set_state(client, "cnl_rvia_state", user_id, {"sid": int(sid), "tid": int(tid)})
+            await _show_rule(client, query, user_id, int(sid), int(tid))
+            # Optional toast via editing is enough; query already answered
+            return
 
+        # Short menu actions: cnl:rv:menu|bot|acc|rule
+        if data.startswith("cnl:rv:"):
+            action = data.split(":")[2] if len(data.split(":")) > 2 else "menu"
+            if sid is None or tid is None:
+                return await query.answer("Session expired — open the rule again", show_alert=True)
+
+            if action == "rule":
+                set_state(client, "cnl_rvia_state", user_id, None)
+                await _show_rule(client, query, user_id, int(sid), int(tid))
+                return await safe_answer(query)
+
+            if action in ("menu", "home"):
+                cnl = await get_cnl(user_id)
+                rule = await cnl.get_forward_rule(int(sid), int(tid), owner_id=user_id) if cnl else None
+                cur = (rule or {}).get("forward_via") or "user_bot"
+                cur_label = "🤖 User Bot" if cur == "user_bot" else "👤 User Account"
+                text = (
+                    "**🚀 Forward Via**\n\n"
+                    f"Rule: `{sid}` → `{tid}`\n"
+                    f"Current: **{cur_label}** (`{cur}`)\n\n"
+                    "Bot ↔ Account switch **requires selecting** one bot or account."
+                )
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        ("✅ " if cur == "user_bot" else "") + "🤖 User Bot",
+                        callback_data="cnl:rv:bot")],
+                    [InlineKeyboardButton(
+                        ("✅ " if cur == "user_account" else "") + "👤 User Account",
+                        callback_data="cnl:rv:acc")],
+                    [InlineKeyboardButton("« Back to Rule", callback_data="cnl:rv:rule")],
+                ])
+                await safe_edit(query, text, kb)
+                return await safe_answer(query)
+
+            if action == "bot":
+                from database import get_user_bots
+                from handlers.ui import format_bot_label
+                bots = await get_user_bots(user_id)
+                if not bots:
+                    return await query.answer("Add a bot under My Bots first", show_alert=True)
+                ids = [str(b.get("bot_id") or "") for b in bots[:20] if b.get("bot_id")]
+                if not ids:
+                    return await query.answer("No valid bot ids", show_alert=True)
+                set_state(client, "cnl_rvia_state", user_id, {
+                    "sid": int(sid), "tid": int(tid), "ids": ids, "kind": "bot",
+                })
+                rows = []
+                for i, b in enumerate(bots[:20]):
+                    if not b.get("bot_id"):
+                        continue
+                    name = format_bot_label(b, short=True)
+                    rows.append([InlineKeyboardButton(
+                        f"🤖 {name}", callback_data=f"cnl:rvp:b:{i}",
+                    )])
+                rows.append([InlineKeyboardButton("« Back", callback_data="cnl:rv:menu")])
+                await safe_edit(
+                    query,
+                    f"**Select ONE My Bot**\n`{sid}` → `{tid}`",
+                    InlineKeyboardMarkup(rows),
+                )
+                return await safe_answer(query)
+
+            if action == "acc":
+                from database import get_user_accounts
+                from handlers.ui import active_accounts_only, format_account_label
+                accs = active_accounts_only(await get_user_accounts(user_id))
+                if not accs:
+                    return await query.answer("Add an **active** account first", show_alert=True)
+                ids = [str(a.get("account_id") or "") for a in accs[:20] if a.get("account_id")]
+                if not ids:
+                    return await query.answer("No valid account ids", show_alert=True)
+                set_state(client, "cnl_rvia_state", user_id, {
+                    "sid": int(sid), "tid": int(tid), "ids": ids, "kind": "acc",
+                })
+                rows = []
+                for i, a in enumerate(accs[:20]):
+                    if not a.get("account_id"):
+                        continue
+                    name = format_account_label(a, short=True)
+                    rows.append([InlineKeyboardButton(
+                        f"👤 {name}", callback_data=f"cnl:rvp:a:{i}",
+                    )])
+                rows.append([InlineKeyboardButton("« Back", callback_data="cnl:rv:menu")])
+                await safe_edit(
+                    query,
+                    f"**Select ONE My Account**\n`{sid}` → `{tid}`",
+                    InlineKeyboardMarkup(rows),
+                )
+                return await safe_answer(query)
+
+            return await query.answer("Unknown action", show_alert=True)
+
+    # ── media types ──
     # ── media types ──
     if data.startswith("cnl:rtype:"):
         parts = data.split(":")
         sid, tid = int(parts[2]), int(parts[3])
         cnl = await get_cnl(user_id)
-        rule = await cnl.get_forward_rule(sid, tid) if cnl else None
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id) if cnl else None
         if not rule:
             return await query.answer("Rule not found", show_alert=True)
         selected = list(rule.get("allowed_types") or ["all"])
@@ -473,7 +827,7 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
             elif action == "clear":
                 selected = ["photo"]
             elif action == "save":
-                await cnl.set_allowed_types(sid, tid, selected)
+                await cnl.set_allowed_types(sid, tid, selected, owner_id=user_id)
                 await query.answer("Types saved")
                 await _show_rule(client, query, user_id, sid, tid)
                 return await safe_answer(query)
@@ -489,8 +843,8 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
                         selected.append(tname)
                     if not selected:
                         selected = ["all"]
-            await cnl.set_allowed_types(sid, tid, selected)
-            rule = await cnl.get_forward_rule(sid, tid)
+            await cnl.set_allowed_types(sid, tid, selected, owner_id=user_id)
+            rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id)
             selected = list(rule.get("allowed_types") or ["all"])
 
         rows = []
@@ -528,24 +882,24 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         sid, tid = int(parts[2]), int(parts[3])
         action = parts[4] if len(parts) > 4 else "menu"
         cnl = await get_cnl(user_id)
-        rule = await cnl.get_forward_rule(sid, tid) if cnl else None
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id) if cnl else None
         if not rule:
             return await query.answer("Rule not found", show_alert=True)
 
         if action == "rmadd":
-            await cnl.set_add_caption(sid, tid, None)
+            await cnl.set_add_caption(sid, tid, None, owner_id=user_id)
             await query.answer("Add caption cleared")
         elif action == "rmcustom":
-            await cnl.set_custom_caption(sid, tid, None)
+            await cnl.set_custom_caption(sid, tid, None, owner_id=user_id)
             await query.answer("Template cleared")
         elif action == "rmold":
-            await cnl.set_remove_old_caption(sid, tid, not rule.get("remove_old_caption", False))
+            await cnl.set_remove_old_caption(sid, tid, not rule.get("remove_old_caption", False), owner_id=user_id)
             await query.answer("Toggled")
         elif action == "reset":
             await cnl.update_forward_rule(sid, tid, {
                 "add_caption": None, "custom_caption": None,
                 "caption_position": "end", "remove_old_caption": False,
-            })
+            }, owner_id=user_id)
             await query.answer("Caption reset")
         elif action == "add":
             set_state(client, CNL_STATE, user_id, {"step": "rule_caption", "sid": sid, "tid": tid})
@@ -589,7 +943,7 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
             return
 
         # refresh menu
-        rule = await cnl.get_forward_rule(sid, tid)
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id)
         text = (
             f"**✏️ Caption**\n\n"
             f"Add caption: `{rule.get('add_caption') or '—'}`\n"
@@ -619,7 +973,7 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         sid, tid = int(parts[2]), int(parts[3])
         action = parts[4] if len(parts) > 4 else "menu"
         cnl = await get_cnl(user_id)
-        rule = await cnl.get_forward_rule(sid, tid) if cnl else None
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id) if cnl else None
         if not rule:
             return await query.answer("Rule not found", show_alert=True)
         words = list(rule.get("block_words") or [])
@@ -640,17 +994,17 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
                 ]))
             return await safe_answer(query)
         if action == "clearyes":
-            await cnl.set_block_words(sid, tid, [])
+            await cnl.set_block_words(sid, tid, [], owner_id=user_id)
             words = []
             await query.answer("Cleared")
         if action == "rm" and len(parts) > 5:
             idx = int(parts[5])
             if 0 <= idx < len(words):
                 words.pop(idx)
-                await cnl.set_block_words(sid, tid, words)
+                await cnl.set_block_words(sid, tid, words, owner_id=user_id)
                 await query.answer("Removed")
 
-        rule = await cnl.get_forward_rule(sid, tid)
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id)
         words = list(rule.get("block_words") or [])
         text = f"**🚫 Block Words** ({len(words)})\n\n{_fmt_words(words)}\n\nMessages containing these words are skipped."
         buttons = []
@@ -669,7 +1023,7 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         sid, tid = int(parts[2]), int(parts[3])
         action = parts[4] if len(parts) > 4 else "menu"
         cnl = await get_cnl(user_id)
-        rule = await cnl.get_forward_rule(sid, tid) if cnl else None
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id) if cnl else None
         if not rule:
             return await query.answer("Rule not found", show_alert=True)
         words = list(rule.get("whitelist_words") or [])
@@ -690,17 +1044,17 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
                 ]))
             return await safe_answer(query)
         if action == "clearyes":
-            await cnl.set_whitelist_words(sid, tid, [])
+            await cnl.set_whitelist_words(sid, tid, [], owner_id=user_id)
             await query.answer("Cleared")
         if action == "rm" and len(parts) > 5:
             idx = int(parts[5])
-            words = list((await cnl.get_forward_rule(sid, tid)).get("whitelist_words") or [])
+            words = list((await cnl.get_forward_rule(sid, tid, owner_id=user_id)).get("whitelist_words") or [])
             if 0 <= idx < len(words):
                 words.pop(idx)
-                await cnl.set_whitelist_words(sid, tid, words)
+                await cnl.set_whitelist_words(sid, tid, words, owner_id=user_id)
                 await query.answer("Removed")
 
-        rule = await cnl.get_forward_rule(sid, tid)
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id)
         words = list(rule.get("whitelist_words") or [])
         text = f"**✅ Whitelist** ({len(words)})\n\n{_fmt_words(words)}\n\nEmpty = no whitelist filter."
         buttons = []
@@ -719,7 +1073,7 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         sid, tid = int(parts[2]), int(parts[3])
         action = parts[4] if len(parts) > 4 else "menu"
         cnl = await get_cnl(user_id)
-        rule = await cnl.get_forward_rule(sid, tid) if cnl else None
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id) if cnl else None
         if not rule:
             return await query.answer("Rule not found", show_alert=True)
         reps = list(rule.get("replacements") or [])
@@ -740,17 +1094,17 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
                 ]))
             return await safe_answer(query)
         if action == "clearyes":
-            await cnl.set_replacements(sid, tid, [])
+            await cnl.set_replacements(sid, tid, [], owner_id=user_id)
             await query.answer("Cleared")
         if action == "rm" and len(parts) > 5:
             idx = int(parts[5])
-            reps = list((await cnl.get_forward_rule(sid, tid)).get("replacements") or [])
+            reps = list((await cnl.get_forward_rule(sid, tid, owner_id=user_id)).get("replacements") or [])
             if 0 <= idx < len(reps):
                 reps.pop(idx)
-                await cnl.set_replacements(sid, tid, reps)
+                await cnl.set_replacements(sid, tid, reps, owner_id=user_id)
                 await query.answer("Removed")
 
-        rule = await cnl.get_forward_rule(sid, tid)
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id)
         reps = list(rule.get("replacements") or [])
         text = f"**🔄 Replacements** ({len(reps)})\n\n{_fmt_reps(reps)}"
         buttons = []
@@ -773,7 +1127,7 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         sid, tid = int(parts[2]), int(parts[3])
         action = parts[4] if len(parts) > 4 else "menu"
         cnl = await get_cnl(user_id)
-        rule = await cnl.get_forward_rule(sid, tid) if cnl else None
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id) if cnl else None
         if not rule:
             return await query.answer("Rule not found", show_alert=True)
 
@@ -794,10 +1148,10 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
                 ]))
             return await safe_answer(query)
         if action == "clearyes":
-            await cnl.set_buttons(sid, tid, None)
+            await cnl.set_buttons(sid, tid, None, owner_id=user_id)
             await query.answer("Cleared")
 
-        rule = await cnl.get_forward_rule(sid, tid)
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id)
         text = f"**🔘 URL Buttons**\n\n{_fmt_buttons(rule.get('buttons'))}"
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Set / Replace", callback_data=f"cnl:rbtn:{sid}:{tid}:add")],
@@ -813,7 +1167,7 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         sid, tid = int(parts[2]), int(parts[3])
         action = parts[4] if len(parts) > 4 else "menu"
         cnl = await get_cnl(user_id)
-        rule = await cnl.get_forward_rule(sid, tid) if cnl else None
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id) if cnl else None
         if not rule:
             return await query.answer("Rule not found", show_alert=True)
 
@@ -823,13 +1177,13 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
                             _kb_back(f"cnl:rdelay:{sid}:{tid}"))
             return await safe_answer(query)
         if action == "off":
-            await cnl.set_delay(sid, tid, 0)
+            await cnl.set_delay(sid, tid, 0, owner_id=user_id)
             await query.answer("Delay disabled")
         if action == "reset":
-            await cnl.set_delay(sid, tid, 0)
+            await cnl.set_delay(sid, tid, 0, owner_id=user_id)
             await query.answer("Reset to 0")
 
-        rule = await cnl.get_forward_rule(sid, tid)
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id)
         d = rule.get("delay") or 0
         text = f"**⏱ Delay**\n\nCurrent: **{d}** seconds"
         kb = InlineKeyboardMarkup([
@@ -847,15 +1201,15 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         sid, tid = int(parts[2]), int(parts[3])
         action = parts[4] if len(parts) > 4 else "menu"
         cnl = await get_cnl(user_id)
-        rule = await cnl.get_forward_rule(sid, tid) if cnl else None
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id) if cnl else None
         if not rule:
             return await query.answer("Rule not found", show_alert=True)
 
         if action == "on":
-            await cnl.set_anti_dupe(sid, tid, True)
+            await cnl.set_anti_dupe(sid, tid, True, owner_id=user_id)
             await query.answer("Anti-dupe ON")
         elif action == "off":
-            await cnl.set_anti_dupe(sid, tid, False)
+            await cnl.set_anti_dupe(sid, tid, False, owner_id=user_id)
             await query.answer("Anti-dupe OFF")
         elif action == "clear":
             await safe_edit(query,
@@ -870,7 +1224,7 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
             await cnl.clear_dupe_for_owner(user_id, tid)
             await query.answer("Hashes cleared for target")
 
-        rule = await cnl.get_forward_rule(sid, tid)
+        rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id)
         on = rule.get("anti_dupe", False)
         text = f"**♻️ Anti-Duplicate**\n\nStatus: {'✅ ON' if on else '❌ OFF'}\nTarget: `{tid}`"
         kb = InlineKeyboardMarkup([
@@ -901,7 +1255,7 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
                 "remove_old_caption": False, "replacements": [], "block_words": [],
                 "whitelist_words": [], "buttons": None, "forward_tag": False,
                 "remove_links": False, "allowed_types": ["all"], "delay": 0, "anti_dupe": False,
-            })
+            }, owner_id=user_id)
         await query.answer("Settings reset")
         await _show_rule(client, query, user_id, sid, tid)
         return await safe_answer(query)
@@ -923,7 +1277,11 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         sid, tid = int(sid), int(tid)
         cnl = await get_cnl(user_id)
         if cnl:
-            await cnl.delete_forward_rule(sid, tid)
+            rule = await cnl.get_forward_rule(sid, tid, owner_id=user_id)
+            await cnl.delete_forward_rule(sid, tid, owner_id=user_id)
+            if rule:
+                from core.lifecycle import on_cnl_rule_deleted
+                await on_cnl_rule_deleted(user_id, rule)
         await query.answer("Deleted")
         query.data = "cnl:rules"
         return await cnl_callbacks(client, query)
@@ -974,7 +1332,8 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
             selected.add(str(mid))
         rows = []
         for b in bots[:20]:
-            name = b.get("bot_username") or b.get("name") or b.get("bot_id") or "?"
+            from handlers.ui import format_bot_label
+            name = format_bot_label(b, short=True)
             bid = str(b.get("bot_id") or "")
             mark = "✅" if bid in selected else "⬜"
             rows.append([InlineKeyboardButton(
@@ -1101,7 +1460,8 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         selected = set(str(x) for x in (doc.get("selected_account_ids") or []))
         rows = []
         for a in accs[:20]:
-            name = a.get("name") or a.get("phone") or a.get("account_id") or "?"
+            from handlers.ui import format_account_label
+            name = format_account_label(a, short=True)
             aid = str(a.get("account_id") or "")
             mark = "✅" if aid in selected else "⬜"
             rows.append([InlineKeyboardButton(
@@ -1143,21 +1503,35 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
 
     if data == "cnl:acc:toggle":
         mgr = get_user_client_manager()
-        if mgr.is_running(user_id):
+        from database import get_account, get_user_accounts
+        from handlers.ui import load_secret
+        # Resolve main selected account_id
+        cnl = await get_cnl(user_id)
+        doc = await cnl.user_sessions.find_one({"user_id": int(user_id)}) if cnl else {}
+        selected = [str(x) for x in ((doc or {}).get("selected_account_ids") or [])]
+        mid = (doc or {}).get("main_account_id")
+        if mid and str(mid) not in selected:
+            selected.insert(0, str(mid))
+        if not selected:
+            try:
+                accs = await get_user_accounts(user_id)
+                if accs:
+                    selected = [str(accs[0].get("account_id") or "")]
+                    selected = [x for x in selected if x]
+            except Exception:
+                pass
+        aid = selected[0] if selected else None
+        if aid and mgr.is_running(user_id, account_id=str(aid)):
+            await mgr.stop_user_client(user_id, account_id=str(aid))
+            await query.answer("Stopped")
+        elif mgr.is_running(user_id) and not aid:
             await mgr.stop_user_client(user_id)
             await query.answer("Stopped")
         else:
-            from database import get_account
-            from handlers.ui import load_secret
-            cnl = await get_cnl(user_id)
-            doc = await cnl.user_sessions.find_one({"user_id": int(user_id)}) if cnl else {}
-            selected = [str(x) for x in ((doc or {}).get("selected_account_ids") or [])]
-            mid = (doc or {}).get("main_account_id")
-            if mid and str(mid) not in selected:
-                selected.insert(0, str(mid))
             ss = None
-            for aid in selected:
-                a = await get_account(user_id, aid)
+            use_aid = None
+            for cand in selected:
+                a = await get_account(user_id, cand)
                 if not a:
                     continue
                 try:
@@ -1165,25 +1539,13 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
                 except Exception:
                     ss = None
                 if ss:
+                    use_aid = str(cand)
                     break
-            if not ss and cnl:
-                ss = await cnl.get_decrypted_session_string(user_id)
             if not ss:
                 return await query.answer("Select a My Account first", show_alert=True)
-            if cnl and selected:
-                a = await get_account(user_id, selected[0])
-                if a:
-                    try:
-                        await cnl.save_user_session(
-                            user_id, ss,
-                            phone_number=a.get("phone") or "",
-                            tg_user_id=a.get("tg_user_id") or 0,
-                            tg_username=a.get("username"),
-                            tg_first_name=a.get("name"),
-                        )
-                    except Exception:
-                        pass
-            ok, msg = await mgr.start_user_client(user_id, session_string=ss)
+            ok, msg = await mgr.start_user_client(
+                user_id, session_string=ss, account_id=use_aid
+            )
             await query.answer(msg if ok else f"Failed: {msg}", show_alert=not ok)
         query.data = "cnl:account"
         return await cnl_callbacks(client, query)
@@ -1204,8 +1566,78 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
             else:
                 if not gc.get("target_chat_id"):
                     return await query.answer("Set a target first", show_alert=True)
-                await cnl.set_global_copy(user_id, True, target_chat_id=gc["target_chat_id"])
+                if not gc.get("my_account_id"):
+                    return await query.answer(
+                        "Select a My Account first (👤 Select Account)",
+                        show_alert=True,
+                    )
+                from database import get_account, AccountStatus
+                a = await get_account(user_id, str(gc["my_account_id"]))
+                if not a:
+                    return await query.answer("Selected account not found", show_alert=True)
+                if (a.get("status") or "").lower() == AccountStatus.DISABLED.value:
+                    return await query.answer(
+                        "Account is disabled — enable it in My Accounts",
+                        show_alert=True,
+                    )
+                await cnl.set_global_copy(
+                    user_id, True,
+                    target_chat_id=gc["target_chat_id"],
+                    my_account_id=str(gc["my_account_id"]),
+                )
+                try:
+                    from core.lifecycle import acquire_my_account
+                    await acquire_my_account(
+                        user_id, str(gc["my_account_id"]), "cnl:gcopy"
+                    )
+                except Exception:
+                    pass
             gc = await cnl.get_global_copy(user_id) or {}
+        elif action in ("acc", "accset"):
+            from database import get_user_accounts, AccountStatus
+            accs = await get_user_accounts(user_id)
+            if action == "accset" and len(parts) > 3:
+                # cnl:gcopy:accset:<account_id> — id may contain no colons
+                aid = ":".join(parts[3:])  # safe if id ever had ':'
+                a = next(
+                    (x for x in accs if str(x.get("account_id") or x.get("_id") or "") == str(aid)),
+                    None,
+                )
+                if not a:
+                    return await query.answer("Account not found", show_alert=True)
+                if (a.get("status") or "").lower() == AccountStatus.DISABLED.value:
+                    return await query.answer("This account is disabled", show_alert=True)
+                aid = str(a.get("account_id") or aid)
+                await cnl.update_global_copy_filters(user_id, {"my_account_id": aid})
+                gc = await cnl.get_global_copy(user_id) or {}
+                await query.answer(f"✅ Account selected: {a.get('name') or aid}")
+            else:
+                rows = []
+                for a in accs[:20]:
+                    aid = str(a.get("account_id") or "")
+                    from handlers.ui import format_account_label
+                    name = format_account_label(a, short=True) if a else aid
+                    st = (a.get("status") or "active").lower()
+                    if st == AccountStatus.DISABLED.value:
+                        rows.append([InlineKeyboardButton(
+                            f"🔴 {name} (disabled)", callback_data="cnl:gcopy"
+                        )])
+                    else:
+                        mark = "✅ " if str(gc.get("my_account_id") or "") == aid else ""
+                        rows.append([InlineKeyboardButton(
+                            f"{mark}👤 {name}", callback_data=f"cnl:gcopy:accset:{aid}"
+                        )])
+                if not rows:
+                    return await query.answer("Add an account under My Accounts first", show_alert=True)
+                rows.append([InlineKeyboardButton("« Back", callback_data="cnl:gcopy")])
+                await safe_edit(
+                    query,
+                    "**👤 Global Copy — Select Account**\n\n"
+                    "Global Copy runs on this User Account.\n"
+                    "Disabled accounts cannot be selected.",
+                    InlineKeyboardMarkup(rows),
+                )
+                return await safe_answer(query)
         elif action == "target":
             set_state(client, CNL_STATE, user_id, {"step": "gcopy_target"})
             await safe_edit(query, "Send target chat ID / @username / link.\n/cancel to abort.",
@@ -1248,27 +1680,115 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
                             InlineKeyboardMarkup(rows))
             return await safe_answer(query)
         elif action == "block":
-            set_state(client, CNL_STATE, user_id, {"step": "gcopy_block"})
-            await safe_edit(query, "Send block words for Global Copy (or `-` to clear).",
-                            _kb_back("cnl:gcopy"))
+            words = list(gc.get("block_words") or [])
+            preview = ", ".join(f"`{w}`" for w in words[:20]) or "_empty_"
+            if len(words) > 20:
+                preview += f" … +{len(words)-20}"
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add words", callback_data="cnl:gcopy:blockadd")],
+                [InlineKeyboardButton("🗑 Delete all", callback_data="cnl:gcopy:blockclear")],
+                [InlineKeyboardButton("« Back", callback_data="cnl:gcopy")],
+            ])
+            await safe_edit(
+                query,
+                f"**🚫 Global Copy — Block words** ({len(words)})\n\n{preview}\n\n"
+                "Add merges with existing list.",
+                kb,
+            )
             return await safe_answer(query)
+        elif action == "blockadd":
+            set_state(client, CNL_STATE, user_id, {"step": "gcopy_block_add"})
+            await safe_edit(
+                query,
+                "**➕ Add block words**\n\nSend words (comma or newline separated).\n/cancel to go back.",
+                _kb_back("cnl:gcopy:block"),
+            )
+            return await safe_answer(query)
+        elif action == "blockclear":
+            await cnl.update_global_copy_filters(user_id, {"block_words": []})
+            await safe_answer(query, "Block words cleared", True)
+            query.data = "cnl:gcopy:block"
+            return await cnl_callbacks(client, query)
         elif action == "white":
-            set_state(client, CNL_STATE, user_id, {"step": "gcopy_white"})
-            await safe_edit(query, "Send whitelist words for Global Copy (or `-` to clear).",
-                            _kb_back("cnl:gcopy"))
+            words = list(gc.get("whitelist_words") or [])
+            preview = ", ".join(f"`{w}`" for w in words[:20]) or "_empty_"
+            if len(words) > 20:
+                preview += f" … +{len(words)-20}"
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add words", callback_data="cnl:gcopy:whiteadd")],
+                [InlineKeyboardButton("🗑 Delete all", callback_data="cnl:gcopy:whiteclear")],
+                [InlineKeyboardButton("« Back", callback_data="cnl:gcopy")],
+            ])
+            await safe_edit(
+                query,
+                f"**✅ Global Copy — Whitelist** ({len(words)})\n\n{preview}",
+                kb,
+            )
             return await safe_answer(query)
+        elif action == "whiteadd":
+            set_state(client, CNL_STATE, user_id, {"step": "gcopy_white_add"})
+            await safe_edit(
+                query,
+                "**➕ Add whitelist words**\n\nSend words (comma or newline separated).\n/cancel to go back.",
+                _kb_back("cnl:gcopy:white"),
+            )
+            return await safe_answer(query)
+        elif action == "whiteclear":
+            await cnl.update_global_copy_filters(user_id, {"whitelist_words": []})
+            await safe_answer(query, "Whitelist cleared", True)
+            query.data = "cnl:gcopy:white"
+            return await cnl_callbacks(client, query)
         elif action == "repl":
-            set_state(client, CNL_STATE, user_id, {"step": "gcopy_repl"})
-            await safe_edit(query, "Send replacements `old => new` for Global Copy (or `-` to clear).",
-                            _kb_back("cnl:gcopy"))
+            reps = list(gc.get("replacements") or [])
+            lines = []
+            for r in reps[:15]:
+                if isinstance(r, dict):
+                    lines.append(f"`{r.get('from','')}` → `{r.get('to','')}`")
+                else:
+                    lines.append(f"`{r}`")
+            preview = "\n".join(lines) or "_empty_"
+            if len(reps) > 15:
+                preview += f"\n… +{len(reps)-15}"
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add replacement", callback_data="cnl:gcopy:repladd")],
+                [InlineKeyboardButton("🗑 Delete all", callback_data="cnl:gcopy:replclear")],
+                [InlineKeyboardButton("« Back", callback_data="cnl:gcopy")],
+            ])
+            await safe_edit(
+                query,
+                f"**🔄 Global Copy — Replacements** ({len(reps)})\n\n{preview}\n\n"
+                "Format: `old => new`",
+                kb,
+            )
             return await safe_answer(query)
+        elif action == "repladd":
+            set_state(client, CNL_STATE, user_id, {"step": "gcopy_repl_add"})
+            await safe_edit(
+                query,
+                "**➕ Add replacements**\n\nSend lines: `old => new`\n/cancel to go back.",
+                _kb_back("cnl:gcopy:repl"),
+            )
+            return await safe_answer(query)
+        elif action == "replclear":
+            await cnl.update_global_copy_filters(user_id, {"replacements": []})
+            await safe_answer(query, "Replacements cleared", True)
+            query.data = "cnl:gcopy:repl"
+            return await cnl_callbacks(client, query)
         elif action == "delay":
             set_state(client, CNL_STATE, user_id, {"step": "gcopy_delay"})
             await safe_edit(query, "Send delay seconds for Global Copy (0–300).",
                             _kb_back("cnl:gcopy"))
             return await safe_answer(query)
         elif action == "ad":
-            await cnl.update_global_copy_filters(user_id, {"anti_dupe": not gc.get("anti_dupe", False)})
+            info = await cnl.get_dupe_db_info(user_id) or {}
+            has_custom = bool(info.get("enabled") and info.get("has_uri"))
+            turning_on = not gc.get("anti_dupe", False)
+            if turning_on and not has_custom:
+                return await query.answer(
+                    "Global Copy anti-dupe requires Custom Anti-Dupe DB (🛡️ Anti-Dupe).",
+                    show_alert=True,
+                )
+            await cnl.update_global_copy_filters(user_id, {"anti_dupe": turning_on})
             gc = await cnl.get_global_copy(user_id) or {}
         elif action == "ft":
             await cnl.update_global_copy_filters(user_id, {"forward_tag": not gc.get("forward_tag", False)})
@@ -1277,17 +1797,43 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
             await cnl.update_global_copy_filters(user_id, {"remove_links": not gc.get("remove_links", False)})
             gc = await cnl.get_global_copy(user_id) or {}
         elif action == "cap":
-            set_state(client, CNL_STATE, user_id, {"step": "gcopy_cap"})
-            await safe_edit(query,
-                "Send add-caption for Global Copy.\n"
-                "Prefix `start:` / `end:` / `gap:`.\n`-` to clear.",
-                _kb_back("cnl:gcopy"))
+            cap = gc.get("add_caption") or ""
+            pos = gc.get("caption_position") or "end"
+            preview = f"`{str(cap)[:200]}`" if cap else "_empty_"
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Set / edit caption", callback_data="cnl:gcopy:capedit")],
+                [InlineKeyboardButton("🗑 Delete caption", callback_data="cnl:gcopy:capclear")],
+                [InlineKeyboardButton("« Back", callback_data="cnl:gcopy")],
+            ])
+            await safe_edit(
+                query,
+                f"**✏️ Global Copy — Caption**\n\nPosition: `{pos}`\nText: {preview}",
+                kb,
+            )
             return await safe_answer(query)
+        elif action == "capedit":
+            set_state(client, CNL_STATE, user_id, {"step": "gcopy_cap"})
+            await safe_edit(
+                query,
+                "**✏️ Set Global Copy caption**\n\n"
+                "Optional prefix: `start:` / `end:` / `gap:`\n"
+                "Send `-` to clear.\n/cancel to go back.",
+                _kb_back("cnl:gcopy:cap"),
+            )
+            return await safe_answer(query)
+        elif action == "capclear":
+            await cnl.update_global_copy_filters(user_id, {"add_caption": None})
+            await safe_answer(query, "Caption cleared", True)
+            query.data = "cnl:gcopy:cap"
+            return await cnl_callbacks(client, query)
+
+
 
         en = gc.get("enabled", False)
         text = (
             f"**📋 Global Copy**\n\n"
             f"Status: {'✅ ON' if en else '⏸ OFF'}\n"
+            f"Account: `{gc.get('my_account_id') or '— (required)'}`\n"
             f"Target: `{gc.get('target_chat_id') or '—'}`\n"
             f"Types: `{', '.join(gc.get('allowed_types') or ['all'])}`\n"
             f"Delay: `{gc.get('delay') or 0}s`\n"
@@ -1302,6 +1848,7 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         )
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("⏸ Disable" if en else "▶️ Enable", callback_data="cnl:gcopy:tog")],
+            [InlineKeyboardButton("👤 Select Account", callback_data="cnl:gcopy:acc")],
             [InlineKeyboardButton("🎯 Set target", callback_data="cnl:gcopy:target"),
              InlineKeyboardButton("📦 Types", callback_data="cnl:gcopy:types")],
             [InlineKeyboardButton("🚫 Block", callback_data="cnl:gcopy:block"),
@@ -1317,43 +1864,139 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         await safe_edit(query, text, kb)
         return await safe_answer(query)
 
-    # ── Dupe DB ──
-    if data == "cnl:dupe":
+    # ── Anti-Duplication / Dupe DB ──
+    if data == "cnl:dupe" or data == "cnl:antidupe":
         cnl = await get_cnl(user_id)
         if not cnl:
             await safe_edit(query, NOT_CONFIGURED, _kb_home(False))
             return await safe_answer(query)
-        info = await cnl.get_dupe_db_info(user_id)
-        if info and info.get("enabled"):
-            text = f"**🔒 Dupe DB**\n\n✅ External anti-dupe enabled\nDB: `{info.get('db_name')}`"
+        info = await cnl.get_dupe_db_info(user_id) or {}
+        custom = bool(info.get("enabled") and info.get("has_uri"))
+        try:
+            from core.cnl.constants import DEFAULT_DUPE_TTL_DAYS
+            from core.access import get_system_settings
+            s = await get_system_settings()
+            ttl_days = s.get("cnl_default_dupe_ttl_days", DEFAULT_DUPE_TTL_DAYS)
+        except Exception:
+            ttl_days = 60
+        if custom:
+            mode = f"✅ **Custom** DB `{info.get('db_name')}` — hashes **permanent** (no TTL)"
+        else:
+            if int(ttl_days or 0) > 0:
+                mode = (
+                    f"📦 **Default** CNL DB `message_hashes`\n"
+                    f"TTL: **{ttl_days} days** auto-delete (owner setting)"
+                )
+            else:
+                mode = "📦 **Default** CNL DB — TTL **disabled** (hashes kept until cleared)"
+        text = (
+            "**🛡️ Anti Duplication**\n\n"
+            f"{mode}\n\n"
+            "• Custom DB → permanent storage\n"
+            "• Default DB → TTL cleanup\n"
+            "• Clear removes **only your** hashes"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗄️ Duplicate DB", callback_data="cnl:dupe:cfg")],
+            [InlineKeyboardButton("📊 Dupe DB Stats", callback_data="cnl:dupe:stats")],
+            [InlineKeyboardButton("🗑️ Clear Duplicate Data", callback_data="cnl:dupe:clear")],
+            [InlineKeyboardButton("« CNL", callback_data="cnl:home")],
+        ])
+        await safe_edit(query, text, kb)
+        return await safe_answer(query)
+
+    if data == "cnl:dupe:cfg":
+        cnl = await get_cnl(user_id)
+        if not cnl:
+            return await query.answer("CNL not configured", show_alert=True)
+        info = await cnl.get_dupe_db_info(user_id) or {}
+        if info.get("enabled") and info.get("has_uri"):
+            text = (
+                f"**🗄️ Duplicate Database**\n\n"
+                f"Mode: **Custom**\n"
+                f"DB: `{info.get('db_name')}`\n"
+                f"Hashes: **permanent** (no automatic TTL)\n\n"
+                f"You can still clear your own hashes manually."
+            )
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🗑 Remove", callback_data="cnl:dupe:rm")],
-                [InlineKeyboardButton("« Back", callback_data="cnl:home")],
+                [InlineKeyboardButton("🗑 Remove Custom DB", callback_data="cnl:dupe:rm")],
+                [InlineKeyboardButton("« Back", callback_data="cnl:dupe")],
             ])
         else:
             text = (
-                "**🔒 Dupe DB**\n\n"
-                "Optional external MongoDB for permanent anti-dupe hashes.\n"
-                "If unset, uses CNL DB `message_hashes`."
+                "**🗄️ Duplicate Database**\n\n"
+                "Mode: **Default** (CNL DB `message_hashes`)\n"
+                "Hashes use owner-configured TTL.\n\n"
+                "Optional: set a **Custom** MongoDB for permanent anti-dupe storage."
             )
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ Set Dupe URI", callback_data="cnl:dupe:set")],
-                [InlineKeyboardButton("« Back", callback_data="cnl:home")],
+                [InlineKeyboardButton("➕ Set Custom Dupe URI", callback_data="cnl:dupe:set")],
+                [InlineKeyboardButton("« Back", callback_data="cnl:dupe")],
             ])
         await safe_edit(query, text, kb)
         return await safe_answer(query)
 
+    if data == "cnl:dupe:stats":
+        cnl = await get_cnl(user_id)
+        if not cnl:
+            return await query.answer("CNL not configured", show_alert=True)
+        st = await cnl.get_dupe_stats(user_id)
+        text = (
+            f"**📊 Duplicate Database**\n\n"
+            f"Database: **{(st.get('mode') or '?').title()}**\n"
+            f"DB name: `{st.get('db_name')}`\n"
+            f"Collection: `{st.get('collection')}`\n\n"
+            f"Total Hashes: **{st.get('total_hashes', 0):,}**\n"
+            f"Storage: `{st.get('storage')}`\n"
+            f"TTL: {st.get('ttl')}\n"
+            f"Oldest: `{st.get('oldest') or '—'}`\n"
+            f"Newest: `{st.get('newest') or '—'}`"
+        )
+        await safe_edit(query, text, InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ Clear My Hashes", callback_data="cnl:dupe:clear")],
+            [InlineKeyboardButton("« Back", callback_data="cnl:dupe")],
+        ]))
+        return await safe_answer(query)
+
+    if data == "cnl:dupe:clear":
+        await safe_edit(
+            query,
+            "**⚠️ Clear Duplicate Data?**\n\n"
+            "This will permanently remove **your** stored\n"
+            "duplicate-detection hashes.\n\n"
+            "Your media / rules / bots / accounts will **NOT** be deleted.\n"
+            "Other users' hashes are not touched.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancel", callback_data="cnl:dupe")],
+                [InlineKeyboardButton("🗑️ Clear", callback_data="cnl:dupe:clear:yes")],
+            ]),
+        )
+        return await safe_answer(query)
+
+    if data == "cnl:dupe:clear:yes":
+        cnl = await get_cnl(user_id)
+        if not cnl:
+            return await query.answer("CNL not configured", show_alert=True)
+        n = await cnl.clear_dupe_for_owner(user_id)
+        await safe_edit(
+            query,
+            f"✅ Cleared **{n:,}** of your duplicate hashes.\n"
+            f"Rules and other CNL data were not changed.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("« Anti Duplication", callback_data="cnl:dupe")]]),
+        )
+        return await safe_answer(query)
+
     if data == "cnl:dupe:set":
         set_state(client, CNL_STATE, user_id, {"step": "dupe_uri"})
-        await safe_edit(query, "Send MongoDB URI for anti-dupe storage.\n/cancel to abort.",
-                        _kb_back("cnl:dupe"))
+        await safe_edit(query, "Send MongoDB URI for **permanent** anti-dupe storage.\n/cancel to abort.",
+                        _kb_back("cnl:dupe:cfg"))
         return await safe_answer(query)
 
     if data == "cnl:dupe:rm":
         cnl = await get_cnl(user_id)
         if cnl:
             await cnl.remove_dupe_db(user_id)
-        await query.answer("Removed")
+        await query.answer("Custom Dupe DB removed — default CNL hashes + TTL")
         query.data = "cnl:dupe"
         return await cnl_callbacks(client, query)
 
@@ -1363,7 +2006,7 @@ async def cnl_callbacks(client: Client, query: CallbackQuery):
         if not cnl:
             await safe_edit(query, NOT_CONFIGURED, _kb_home(False))
             return await safe_answer(query)
-        stats = await cnl.get_stats()
+        stats = await cnl.get_stats(owner_id=user_id)
         q = await cnl.get_user_quota_info(user_id)
         text = (
             f"**📊 CNL Stats**\n\n"
@@ -1460,7 +2103,7 @@ async def handle_cnl_text(client: Client, message: Message) -> bool:
             return True
         cnl = await get_cnl(user_id)
         if cnl:
-            await cnl.set_delay(state["sid"], state["tid"], d)
+            await cnl.set_delay(state["sid"], state["tid"], d, owner_id=user_id)
         set_state(client, CNL_STATE, user_id, None)
         await message.reply(f"✅ Delay set to {d}s")
         return True
@@ -1471,7 +2114,7 @@ async def handle_cnl_text(client: Client, message: Message) -> bool:
             set_state(client, CNL_STATE, user_id, None)
             return True
         if text == "-":
-            await cnl.set_add_caption(state["sid"], state["tid"], None)
+            await cnl.set_add_caption(state["sid"], state["tid"], None, owner_id=user_id)
             await message.reply("✅ Add caption cleared")
         else:
             pos, cap = "end", text
@@ -1482,7 +2125,7 @@ async def handle_cnl_text(client: Client, message: Message) -> bool:
                 pos, cap = "end_with_gap", text[4:].strip()
             elif low.startswith("end:"):
                 pos, cap = "end", text[4:].strip()
-            await cnl.set_add_caption(state["sid"], state["tid"], cap, pos)
+            await cnl.set_add_caption(state["sid"], state["tid"], cap, pos, owner_id=user_id)
             await message.reply(f"✅ Add caption set ({pos})")
         set_state(client, CNL_STATE, user_id, None)
         return True
@@ -1493,10 +2136,10 @@ async def handle_cnl_text(client: Client, message: Message) -> bool:
             set_state(client, CNL_STATE, user_id, None)
             return True
         if text == "-":
-            await cnl.set_custom_caption(state["sid"], state["tid"], None)
+            await cnl.set_custom_caption(state["sid"], state["tid"], None, owner_id=user_id)
             await message.reply("✅ Template cleared")
         else:
-            await cnl.set_custom_caption(state["sid"], state["tid"], text)
+            await cnl.set_custom_caption(state["sid"], state["tid"], text, owner_id=user_id)
             await message.reply("✅ Custom caption template saved")
         set_state(client, CNL_STATE, user_id, None)
         return True
@@ -1507,7 +2150,7 @@ async def handle_cnl_text(client: Client, message: Message) -> bool:
             set_state(client, CNL_STATE, user_id, None)
             return True
         if text == "-":
-            await cnl.set_replacements(state["sid"], state["tid"], [])
+            await cnl.set_replacements(state["sid"], state["tid"], [], owner_id=user_id)
         else:
             existing = (await cnl.get_forward_rule(state["sid"], state["tid"]) or {}).get("replacements") or []
             reps = list(existing)
@@ -1515,7 +2158,7 @@ async def handle_cnl_text(client: Client, message: Message) -> bool:
                 if "=>" in line:
                     a, b = line.split("=>", 1)
                     reps.append({"from": a.strip(), "to": b.strip()})
-            await cnl.set_replacements(state["sid"], state["tid"], reps)
+            await cnl.set_replacements(state["sid"], state["tid"], reps, owner_id=user_id)
         set_state(client, CNL_STATE, user_id, None)
         await message.reply("✅ Replacements updated")
         return True
@@ -1524,12 +2167,12 @@ async def handle_cnl_text(client: Client, message: Message) -> bool:
         cnl = await get_cnl(user_id)
         if cnl:
             if text == "-":
-                await cnl.set_block_words(state["sid"], state["tid"], [])
+                await cnl.set_block_words(state["sid"], state["tid"], [], owner_id=user_id)
             else:
                 existing = list((await cnl.get_forward_rule(state["sid"], state["tid"]) or {}).get("block_words") or [])
                 new = cnl._normalize_word_list(text)
                 merged = list(dict.fromkeys(existing + new))
-                await cnl.set_block_words(state["sid"], state["tid"], merged)
+                await cnl.set_block_words(state["sid"], state["tid"], merged, owner_id=user_id)
         set_state(client, CNL_STATE, user_id, None)
         await message.reply("✅ Block words updated")
         return True
@@ -1538,12 +2181,12 @@ async def handle_cnl_text(client: Client, message: Message) -> bool:
         cnl = await get_cnl(user_id)
         if cnl:
             if text == "-":
-                await cnl.set_whitelist_words(state["sid"], state["tid"], [])
+                await cnl.set_whitelist_words(state["sid"], state["tid"], [], owner_id=user_id)
             else:
                 existing = list((await cnl.get_forward_rule(state["sid"], state["tid"]) or {}).get("whitelist_words") or [])
                 new = cnl._normalize_word_list(text)
                 merged = list(dict.fromkeys(existing + new))
-                await cnl.set_whitelist_words(state["sid"], state["tid"], merged)
+                await cnl.set_whitelist_words(state["sid"], state["tid"], merged, owner_id=user_id)
         set_state(client, CNL_STATE, user_id, None)
         await message.reply("✅ Whitelist updated")
         return True
@@ -1552,7 +2195,7 @@ async def handle_cnl_text(client: Client, message: Message) -> bool:
         cnl = await get_cnl(user_id)
         if cnl:
             btns = None if text == "-" else parse_buttons(text)
-            await cnl.set_buttons(state["sid"], state["tid"], btns)
+            await cnl.set_buttons(state["sid"], state["tid"], btns, owner_id=user_id)
         set_state(client, CNL_STATE, user_id, None)
         await message.reply("✅ Buttons updated")
         return True
@@ -1569,27 +2212,49 @@ async def handle_cnl_text(client: Client, message: Message) -> bool:
         await message.reply(f"✅ Global copy target `{cid}` (enabled)")
         return True
 
-    if step == "gcopy_block":
+    if step in ("gcopy_block", "gcopy_block_add"):
         cnl = await get_cnl(user_id)
         if cnl:
-            words = [] if text == "-" else cnl._normalize_word_list(text)
+            gc = await cnl.get_global_copy(user_id) or {}
+            existing = list(gc.get("block_words") or [])
+            if text == "-":
+                words = []
+            else:
+                add = cnl._normalize_word_list(text)
+                if step == "gcopy_block_add":
+                    seen = {w.lower() for w in existing}
+                    words = existing + [w for w in add if w.lower() not in seen]
+                else:
+                    words = add
             await cnl.update_global_copy_filters(user_id, {"block_words": words})
         set_state(client, CNL_STATE, user_id, None)
         await message.reply("✅ Global copy block words updated")
         return True
 
-    if step == "gcopy_white":
+    if step in ("gcopy_white", "gcopy_white_add"):
         cnl = await get_cnl(user_id)
         if cnl:
-            words = [] if text == "-" else cnl._normalize_word_list(text)
+            gc = await cnl.get_global_copy(user_id) or {}
+            existing = list(gc.get("whitelist_words") or [])
+            if text == "-":
+                words = []
+            else:
+                add = cnl._normalize_word_list(text)
+                if step == "gcopy_white_add":
+                    seen = {w.lower() for w in existing}
+                    words = existing + [w for w in add if w.lower() not in seen]
+                else:
+                    words = add
             await cnl.update_global_copy_filters(user_id, {"whitelist_words": words})
         set_state(client, CNL_STATE, user_id, None)
         await message.reply("✅ Global copy whitelist updated")
         return True
 
-    if step == "gcopy_repl":
+    if step in ("gcopy_repl", "gcopy_repl_add"):
         cnl = await get_cnl(user_id)
         if cnl:
+            gc = await cnl.get_global_copy(user_id) or {}
+            existing = list(gc.get("replacements") or [])
             if text == "-":
                 reps = []
             else:
@@ -1598,6 +2263,8 @@ async def handle_cnl_text(client: Client, message: Message) -> bool:
                     if "=>" in line:
                         a, b = line.split("=>", 1)
                         reps.append({"from": a.strip(), "to": b.strip()})
+                if step == "gcopy_repl_add":
+                    reps = existing + reps
             await cnl.update_global_copy_filters(user_id, {"replacements": reps})
         set_state(client, CNL_STATE, user_id, None)
         await message.reply("✅ Global copy replacements updated")

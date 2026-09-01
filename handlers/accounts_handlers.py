@@ -37,7 +37,12 @@ logger = logging.getLogger(__name__)
 
 
 def account_detail_text(account: dict) -> str:
+    from handlers.ui import format_account_label
+
     name = account.get("name") or account.get("phone") or "Unknown"
+    uname = account.get("username")
+    uname_s = f"@{uname}" if uname else "—"
+    tg_id = account.get("tg_user_id") or "—"
     status = account.get("status", "active")
     limit = account.get("forward_limit", 500)
     sleep_min = account.get("sleep_after_limit_minutes", 30)
@@ -50,10 +55,13 @@ def account_detail_text(account: dict) -> str:
         flood = err[:80]
 
     text = (
-        f"**👤 {name}**\n\n"
+        f"**👤 {format_account_label(account, short=True)}**\n\n"
         f"{icon} **{status.title()}**\n"
         f"{HR}\n"
-        f"**Phone:** `{account.get('phone')}`\n"
+        f"**Name:** {name}\n"
+        f"**Username:** {uname_s}\n"
+        f"**Telegram ID:** `{tg_id}`\n"
+        f"**Phone:** `{account.get('phone') or '—'}`\n"
         f"**Current Cycle:** `{forwarded}/{limit}`\n"
         f"**Total Forwarded:** `{total:,}`\n"
         f"**Forward Limit:** `{limit}`\n"
@@ -87,10 +95,12 @@ async def show_accounts_list(client: Client, query: CallbackQuery, page: int = 0
         await safe_edit(query, text, accounts_list_keyboard([]))
         return await safe_answer(query)
 
+    from handlers.ui import format_account_label
+
     slice_, page, total_pages = paginate(accounts, page)
     lines = [f"**👤 My Accounts** ({len(accounts)})\n"]
     for acc in slice_:
-        name = acc.get("name") or acc.get("phone") or "Unknown"
+        label = format_account_label(acc, short=True)
         status = acc.get("status", "active")
         icon = status_icon(status)
         limit = acc.get("forward_limit", 500)
@@ -98,7 +108,7 @@ async def show_accounts_list(client: Client, query: CallbackQuery, page: int = 0
         extra = ""
         if status == "sleeping":
             extra = f"  remaining `{remaining(acc.get('sleep_until'))}`"
-        lines.append(f"{icon} **{name}**  `{cycle}/{limit}`{extra}")
+        lines.append(f"{icon} **{label}**  `{cycle}/{limit}`{extra}")
     kb = with_pager(accounts_list_keyboard(slice_), "acc:listp:", page, total_pages)
     await safe_edit(query, "\n".join(lines), kb)
     await safe_answer(query)
@@ -123,9 +133,31 @@ async def _test_account(account: dict) -> str:
     try:
         await temp.start()
         me = await temp.get_me()
-        uname = f"@{me.username}" if me.username else str(me.id)
-        name = me.first_name or ""
-        return f"✅ Connected as **{name}** ({uname})"
+        uname = f"@{me.username}" if me.username else "—"
+        name = " ".join(
+            x for x in [(me.first_name or ""), (me.last_name or "")] if x
+        ).strip() or "Account"
+        # Refresh profile fields on successful test
+        try:
+            from database import update_account
+            await update_account(
+                account.get("user_id"),
+                account.get("account_id"),
+                {
+                    "name": name,
+                    "first_name": me.first_name,
+                    "last_name": me.last_name,
+                    "username": me.username,
+                    "tg_user_id": me.id,
+                },
+            )
+        except Exception:
+            pass
+        return (
+            f"✅ Connected as **{name}**\n"
+            f"Username: {uname}\n"
+            f"Telegram ID: `{me.id}`"
+        )
     except Exception as e:
         return friendly_error("account test", e)
     finally:
@@ -197,6 +229,22 @@ async def accounts_callbacks(client: Client, query: CallbackQuery):
         current = account.get("status", "active")
         new_status = AccountStatus.DISABLED.value if current == AccountStatus.ACTIVE.value else AccountStatus.ACTIVE.value
         await set_account_status(user_id, account_id, new_status)
+        if new_status == AccountStatus.DISABLED.value:
+            # Fully offline — stop any CNL client using this account
+            try:
+                from core.cnl.clients import get_user_client_manager
+                await get_user_client_manager().stop_user_client(user_id, account_id=str(account_id))
+            except Exception:
+                logger.debug("stop disabled account client failed", exc_info=True)
+            try:
+                from core.lifecycle import release_my_account
+                # drop CNL deps for this account
+                from core import lifecycle as lc
+                key = f"acc:{int(user_id)}:{account_id}"
+                async with lc._lock:
+                    lc._acc_deps.pop(key, None)
+            except Exception:
+                pass
 
         account = await get_account_scoped(user_id, account_id)
         await safe_edit(query, account_detail_text(account), account_settings_keyboard(account))

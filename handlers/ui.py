@@ -64,6 +64,69 @@ def status_icon(status: Optional[str]) -> str:
     return STATUS_ICON.get((status or "").lower(), "⚪")
 
 
+def format_account_label(acc: Optional[dict], *, short: bool = False) -> str:
+    """
+    short=True (inline buttons): display name only.
+    short=False (detail): @username · id or Name · id.
+    """
+    if not acc:
+        return "Unknown"
+    uname = (acc.get("username") or "").strip().lstrip("@")
+    tg_id = acc.get("tg_user_id") or acc.get("telegram_id")
+    name = (acc.get("name") or acc.get("first_name") or "").strip()
+    last = (acc.get("last_name") or "").strip()
+    if name and last and last not in name:
+        name = f"{name} {last}".strip()
+    phone = acc.get("phone") or ""
+
+    if short:
+        if name and name != phone and not str(name).startswith("+"):
+            return name[:40]
+        if uname:
+            return f"@{uname}"[:40]
+        if name:
+            return name[:40]
+        if phone:
+            return str(phone)[:40]
+        return str(acc.get("account_id") or "Account")[:12]
+
+    if uname:
+        return f"@{uname} · `{tg_id}`" if tg_id else f"@{uname}"
+    if name:
+        return f"{name} · `{tg_id}`" if tg_id else name
+    if tg_id:
+        return f"`{tg_id}`"
+    if phone:
+        return str(phone)
+    return str(acc.get("account_id") or "Account")[:12]
+
+
+def format_bot_label(bot: Optional[dict], *, short: bool = False) -> str:
+    """short=True: name only for buttons."""
+    if not bot:
+        return "Bot"
+    name = (bot.get("name") or "").strip() or "Bot"
+    uname = (bot.get("bot_username") or bot.get("username") or "").strip().lstrip("@")
+    if short:
+        return name[:40]
+    if uname:
+        return f"{name} · @{uname}"
+    bid = bot.get("bot_id")
+    if bid:
+        return f"{name} · `{str(bid)[:10]}`"
+    return name
+
+
+def is_account_disabled(acc: Optional[dict]) -> bool:
+    if not acc:
+        return True
+    return (acc.get("status") or "").lower() in ("disabled", "inactive", "error")
+
+
+def active_accounts_only(accounts: Optional[List[dict]]) -> List[dict]:
+    return [a for a in (accounts or []) if not is_account_disabled(a)]
+
+
 def clamp_interval(raw) -> int:
     try:
         n = int(float(raw))
