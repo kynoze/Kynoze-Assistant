@@ -27,7 +27,8 @@ class CnlBotManager:
             return f"{int(user_id)}:{bot_id}"
         return str(int(user_id))
 
-    def _attach_handler(self, client: Client, owner_id: int):
+    def _attach_handler(self, client: Client, owner_id: int, my_bot_id: str = None):
+        """my_bot_id = My Bots pool id bound to this client (one bot per rule)."""
         async def _wrapper(c: Client, message):
             from core.cnl.engine import process_and_forward
             from core.cnl.db import get_cnl
@@ -39,6 +40,10 @@ class CnlBotManager:
                 if rule.get("forward_via") != "user_bot":
                     continue
                 if int(rule.get("owner_id") or 0) != int(owner_id):
+                    continue
+                # One bot per rule: skip if rule is bound to a different My Bot
+                rule_bot = rule.get("my_bot_id") or rule.get("exec_bot_id")
+                if rule_bot and my_bot_id and str(rule_bot) != str(my_bot_id):
                     continue
                 try:
                     await process_and_forward(c, message, rule, owner_id)
@@ -134,18 +139,34 @@ class CnlBotManager:
                 in_memory=True,
                 workers=self.workers,
             )
-            self._attach_handler(client, uid)
+            self._attach_handler(client, uid, my_bot_id=str(bot_id) if bot_id else None)
             try:
                 await client.start()
                 me = await client.get_me()
-                await cnl.save_user_bot(uid, token, me.id, me.username, me.first_name)
+                # My Bots is source of truth when bot_id is set — only store metadata ref, not a second copy of the token
                 if bot_id:
-                    await cnl.user_bots.update_one(
-                        {"user_id": uid},
-                        {"$addToSet": {"selected_bot_ids": str(bot_id)}, "$set": {"main_bot_id": str(bot_id)}},
-                        upsert=True,
-                    )
-                await cnl.mark_bot_active(uid)
+                    try:
+                        await cnl.user_bots.update_one(
+                            {"user_id": uid},
+                            {"$set": {
+                                "user_id": uid,
+                                "main_bot_id": str(bot_id),
+                                "tg_bot_id": me.id,
+                                "bot_username": me.username,
+                                "bot_name": me.first_name,
+                                "from_my_bots": True,
+                            }, "$addToSet": {"selected_bot_ids": str(bot_id)}},
+                            upsert=True,
+                        )
+                    except Exception:
+                        logger.debug("cnl user_bots meta update failed", exc_info=True)
+                else:
+                    # Legacy path: token only exists in CNL DB
+                    await cnl.save_user_bot(uid, token, me.id, me.username, me.first_name)
+                try:
+                    await cnl.mark_bot_active(uid)
+                except Exception:
+                    pass
                 self._bots[key] = client
                 uname = f"@{me.username}" if me.username else str(me.id)
                 logger.info("CNL bot started for %s key=%s as %s", uid, key, uname)
@@ -156,6 +177,17 @@ class CnlBotManager:
                 except Exception:
                     pass
                 return False, f"{type(e).__name__}: {e}"
+
+    async def stop_all(self) -> None:
+        async with self._lock:
+            keys = list(self._bots.keys())
+            for key in keys:
+                c = self._bots.pop(key, None)
+                if c:
+                    try:
+                        await c.stop()
+                    except Exception:
+                        pass
 
     async def stop_user_bot(self, user_id: int, bot_id: Optional[str] = None) -> None:
         uid = int(user_id)

@@ -91,60 +91,30 @@ async def is_user_admin_of_chat(client: Client, chat_id: int, user_id: int) -> b
     except Exception:
         return False
 
-async def check_user_bot_permissions(user_id: int, source_id: int, target_id: int) -> Optional[str]:
-    from core.cnl.db import get_cnl
+async def check_user_bot_permissions(user_id: int, source_id: int, target_id: int, bot_id: str = None) -> Optional[str]:
+    """Prefer verify_cnl_bot_rule with explicit bot_id. Legacy path uses running CNL bot."""
+    from core.permissions import verify_cnl_bot_rule
+    if bot_id:
+        return await verify_cnl_bot_rule(user_id, str(bot_id), int(source_id), int(target_id))
     from core.cnl.bots import get_user_bot_manager
-    cnl = await get_cnl(user_id)
-    if not cnl or not await cnl.has_active_bot(user_id):
-        return "CNL bot required. Connect a bot first."
-    ub = await get_user_bot_manager().get_bot(user_id)
-    if not ub or not ub.is_connected:
-        return "CNL bot offline. Reconnect your bot."
-    try:
-        st = getattr((await ub.get_chat_member(source_id, "me")).status, "value", "").lower()
-        if st in ("left", "kicked", "banned"):
-            return "Bot not in source chat."
-    except Exception as e:
-        return f"Source check failed: {type(e).__name__}"
-    try:
-        m = await ub.get_chat_member(target_id, "me")
-        st = getattr(m.status, "value", "").lower()
-        if st in ("left", "kicked", "banned"):
-            return "Bot not in target chat."
-        chat = await ub.get_chat(target_id)
-        if getattr(chat.type, "name", "").upper() == "CHANNEL" and m.status not in (
-            ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER
-        ):
-            return "Bot must be admin in channel target."
-    except Exception as e:
-        return f"Target check failed: {type(e).__name__}"
-    return None
+    from database import get_user_bots
+    bots = await get_user_bots(user_id)
+    if not bots:
+        return "❌ Add a bot under My Bots first."
+    bid = str(bots[0].get("bot_id") or "")
+    if not bid:
+        return "❌ Add a bot under My Bots first."
+    return await verify_cnl_bot_rule(user_id, bid, int(source_id), int(target_id))
 
-async def check_user_account_permissions(user_id: int, source_id: int, target_id: int) -> Optional[str]:
-    from core.cnl.db import get_cnl
-    from core.cnl.clients import get_user_client_manager
-    cnl = await get_cnl(user_id)
-    if not cnl or not await cnl.has_active_session(user_id):
-        return "CNL account required. Connect an account first."
-    uc = await get_user_client_manager().get_client(user_id)
-    if not uc or not uc.is_connected:
-        return "CNL account offline. Reconnect your account."
-    try:
-        st = getattr((await uc.get_chat_member(source_id, "me")).status, "value", "").lower()
-        if st in ("left", "kicked", "banned"):
-            return "Account not in source."
-    except Exception as e:
-        return f"Source check failed: {type(e).__name__}"
-    try:
-        m = await uc.get_chat_member(target_id, "me")
-        st = getattr(m.status, "value", "").lower()
-        if st in ("left", "kicked", "banned"):
-            return "Account not in target."
-        chat = await uc.get_chat(target_id)
-        if getattr(chat.type, "name", "").upper() == "CHANNEL" and m.status not in (
-            ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER
-        ):
-            return "Account must be admin for channel target."
-    except Exception as e:
-        return f"Target check failed: {type(e).__name__}"
-    return None
+async def check_user_account_permissions(user_id: int, source_id: int, target_id: int, account_id: str = None) -> Optional[str]:
+    from core.permissions import verify_cnl_account_rule
+    if account_id:
+        return await verify_cnl_account_rule(user_id, str(account_id), int(source_id), int(target_id))
+    from database import get_user_accounts
+    accs = await get_user_accounts(user_id)
+    if not accs:
+        return "❌ Add an account under My Accounts first."
+    aid = str(accs[0].get("account_id") or "")
+    if not aid:
+        return "❌ Add an account under My Accounts first."
+    return await verify_cnl_account_rule(user_id, aid, int(source_id), int(target_id))

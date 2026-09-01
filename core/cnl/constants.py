@@ -24,9 +24,12 @@ GLOBAL_COPY_FILTER_KEYS = {
     "block_words", "whitelist_words", "replacements", "add_caption",
     "caption_position", "custom_caption", "remove_old_caption", "remove_links",
     "buttons", "delay", "anti_dupe", "forward_tag", "allowed_types",
-    "target_chat_id", "enabled",
+    "target_chat_id", "enabled", "my_account_id",
 }
 NOT_CONFIGURED = (
     "⚠️ **CNL Database is not configured.**\n"
     "Please add your MongoDB URI to use CNL features."
 )
+
+# Default CNL DB message_hashes TTL (days). Custom Dupe DB = permanent (no TTL).
+DEFAULT_DUPE_TTL_DAYS = 60

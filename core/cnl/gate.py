@@ -54,6 +54,12 @@ async def get_gate_uri_plain(user_id: int) -> Optional[str]:
     return decrypt_session(doc["uri_encrypted"])
 
 async def is_cnl_configured(user_id: int) -> bool:
+    try:
+        from core.db_resolver import resolve_feature_db
+        r = await resolve_feature_db(int(user_id), "cnl")
+        return bool(r.get("configured") and r.get("uri"))
+    except Exception:
+        pass
     doc = await _coll().find_one(
         {"user_id": int(user_id), "enabled": True, "uri_encrypted": {"$exists": True, "$ne": ""}},
         {"_id": 1},

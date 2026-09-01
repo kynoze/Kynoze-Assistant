@@ -37,7 +37,7 @@ from pyrogram.types import (
     InputMediaPhoto, InputMediaVideo, Message,
 )
 
-from core.cnl.clean import clean_file_name, remove_links_and_usernames
+from core.cnl.clean import clean_file_name
 from core.cnl.constants import ALBUM_WAIT_SECONDS, FORWARD_CONCURRENCY
 from core.cnl.db import get_cnl
 
@@ -92,7 +92,7 @@ def process_original_text(original: Optional[str], rule: dict) -> Optional[str]:
         return None
     processed = apply_replacements(original, rule.get("replacements") or [])
     if rule.get("remove_links") and processed:
-        processed = remove_links_and_usernames(processed)
+        # Single entry: clean_file_name (tested) handles media full-clean + links/usernames
         processed = clean_file_name(processed) if processed else processed
     return processed
 
@@ -274,7 +274,7 @@ async def _send_single(
             await cnl.record_forward_success(source_id, target_id, owner_id)
     except Exception:
         if cnl:
-            await cnl.record_failed(source_id, target_id)
+            await cnl.record_failed(source_id, target_id, owner_id)
         raise
 
 
@@ -312,11 +312,43 @@ async def _send_album(
             await cnl.record_forward_success(source_id, target_id, owner_id)
     except Exception:
         if cnl:
-            await cnl.record_failed(source_id, target_id)
+            await cnl.record_failed(source_id, target_id, owner_id)
         raise
 
 
 # ── main entry ──────────────────────────────────────────────────────────────
+
+
+async def _auto_disable_rule(owner_id: int, rule: dict, reason: str, error: str) -> None:
+    """Stop a CNL rule without user tap (dead session / lost write access)."""
+    try:
+        cnl = await get_cnl(owner_id)
+        sid = int(rule.get("source_chat_id") or 0)
+        tid = int(rule.get("target_chat_id") or 0)
+        if cnl and sid and tid:
+            await cnl.set_rule_enabled(sid, tid, False, owner_id=owner_id)
+            try:
+                await cnl.update_forward_rule(
+                    sid, tid, {"last_error": error[:500]}, owner_id=owner_id
+                )
+            except Exception:
+                pass
+        try:
+            from core.lifecycle import on_cnl_rule_disabled
+            await on_cnl_rule_disabled(owner_id, rule)
+        except Exception:
+            pass
+        from core.log_chat import report_user_auto_stop
+        await report_user_auto_stop(
+            owner_id,
+            feature="CNL Auto-Post",
+            title=f"`{sid}` → `{tid}`",
+            reason=reason,
+            error=error,
+        )
+    except Exception:
+        logger.exception("CNL auto-disable failed")
+
 
 async def process_and_forward(client: Client, message: Message, rule: dict, owner_id: int):
     """Process one incoming message against one rule using the given client."""
@@ -333,10 +365,10 @@ async def process_and_forward(client: Client, message: Message, rule: dict, owne
 
     text = message.caption or message.text
     if is_blocked(text, rule.get("block_words") or []):
-        await cnl.record_blocked(source_id, target_id)
+        await cnl.record_blocked(source_id, target_id, owner_id)
         return
     if not is_whitelisted(text, rule.get("whitelist_words") or []):
-        await cnl.record_blocked(source_id, target_id)
+        await cnl.record_blocked(source_id, target_id, owner_id)
         return
 
     # album path
@@ -344,7 +376,8 @@ async def process_and_forward(client: Client, message: Message, rule: dict, owne
         await _handle_album_message(client, message, rule, owner_id)
         return
 
-    # anti-dupe (media only)
+    # anti-dupe: reserve hash, release if quota/send fails (do not permanent-lock on failure)
+    claimed_hash = None
     if rule.get("anti_dupe"):
         h = get_content_hash(message)
         if h:
@@ -352,12 +385,22 @@ async def process_and_forward(client: Client, message: Message, rule: dict, owne
                 owner_id, h, target_id, source_id, message.id
             )
             if not claimed:
-                await cnl.record_duplicate_skipped(source_id, target_id)
+                await cnl.record_duplicate_skipped(source_id, target_id, owner_id)
                 return
+            claimed_hash = h
 
     if not await cnl.try_consume_quota(owner_id):
         logger.info("CNL quota exhausted owner=%s", owner_id)
+        if claimed_hash:
+            await cnl.release_hash_for_owner(owner_id, claimed_hash, target_id)
         return
+
+    async def _release_claim():
+        if claimed_hash:
+            try:
+                await cnl.release_hash_for_owner(owner_id, claimed_hash, target_id)
+            except Exception:
+                logger.debug("hash release failed", exc_info=True)
 
     async def _do():
         if rule.get("forward_tag"):
@@ -373,29 +416,51 @@ async def process_and_forward(client: Client, message: Message, rule: dict, owne
         for attempt in range(3):
             try:
                 await _do()
-                return
+                return  # success — keep claimed hash
             except (AuthKeyUnregistered, SessionRevoked, UserDeactivated,
                     AccessTokenInvalid, AccessTokenExpired) as e:
                 logger.warning("CNL auth dead owner=%s via=%s: %s", owner_id, rule.get("forward_via"), type(e).__name__)
-                await cnl.record_failed(source_id, target_id)
+                await cnl.record_failed(source_id, target_id, owner_id)
+                await _release_claim()
+                await _auto_disable_rule(
+                    owner_id,
+                    {**rule, "source_chat_id": source_id, "target_chat_id": target_id},
+                    "CNL rule auto-disabled — bot/account session is dead (revoked / deactivated / invalid token).",
+                    f"{type(e).__name__}: {e}",
+                )
                 return
             except FloodWait as e:
                 if attempt < 2:
                     await asyncio.sleep(e.value + 1)
                     continue
-                await cnl.record_failed(source_id, target_id)
+                await cnl.record_failed(source_id, target_id, owner_id)
+                await _release_claim()
                 return
-            except (ChatWriteForbidden, PeerIdInvalid, MessageIdInvalid) as e:
+            except (ChatWriteForbidden, PeerIdInvalid) as e:
                 logger.error("CNL cannot write %s: %s", target_id, e)
-                await cnl.record_failed(source_id, target_id)
+                await cnl.record_failed(source_id, target_id, owner_id)
+                await _release_claim()
+                await _auto_disable_rule(
+                    owner_id,
+                    {**rule, "source_chat_id": source_id, "target_chat_id": target_id},
+                    "CNL rule auto-disabled — cannot write to the target chat (kicked / not admin / peer invalid).",
+                    f"{type(e).__name__}: {e}",
+                )
+                return
+            except MessageIdInvalid as e:
+                logger.error("CNL MessageIdInvalid %s: %s", target_id, e)
+                await cnl.record_failed(source_id, target_id, owner_id)
+                await _release_claim()
                 return
             except RPCError as e:
                 logger.error("CNL RPCError → %s: %s", target_id, e)
-                await cnl.record_failed(source_id, target_id)
+                await cnl.record_failed(source_id, target_id, owner_id)
+                await _release_claim()
                 return
             except Exception:
                 logger.exception("CNL unexpected → %s", target_id)
-                await cnl.record_failed(source_id, target_id)
+                await cnl.record_failed(source_id, target_id, owner_id)
+                await _release_claim()
                 return
 
 
@@ -420,11 +485,12 @@ async def _handle_album_message(client: Client, message: Message, rule: dict, ow
             target_id = int(rule["target_chat_id"])
             text = msgs[0].caption or msgs[0].text
             if is_blocked(text, rule.get("block_words") or []):
-                await cnl.record_blocked(source_id, target_id)
+                await cnl.record_blocked(source_id, target_id, owner_id)
                 return
             if not is_whitelisted(text, rule.get("whitelist_words") or []):
-                await cnl.record_blocked(source_id, target_id)
+                await cnl.record_blocked(source_id, target_id, owner_id)
                 return
+            claimed_hash = None
             if rule.get("anti_dupe"):
                 h = get_album_hash(msgs)
                 if h:
@@ -432,15 +498,21 @@ async def _handle_album_message(client: Client, message: Message, rule: dict, ow
                         owner_id, h, target_id, source_id, msgs[0].id
                     )
                     if not claimed:
-                        await cnl.record_duplicate_skipped(source_id, target_id)
+                        await cnl.record_duplicate_skipped(source_id, target_id, owner_id)
                         return
+                    claimed_hash = h
             if not await cnl.try_consume_quota(owner_id):
+                if claimed_hash:
+                    await cnl.release_hash_for_owner(owner_id, claimed_hash, target_id)
                 return
             try:
                 async with _forward_sem:
                     await _send_album(client, msgs, rule, target_id, source_id, owner_id)
             except Exception:
                 logger.exception("CNL album send fail")
+                if claimed_hash:
+                    await cnl.release_hash_for_owner(owner_id, claimed_hash, target_id)
+                await cnl.record_failed(source_id, target_id, owner_id)
 
         _album_tasks[key] = asyncio.create_task(_flush())
 
@@ -452,6 +524,13 @@ async def process_global_copy(client: Client, message: Message, owner_id: int):
     gc = await cnl.get_global_copy(owner_id)
     if not gc or not gc.get("enabled") or not gc.get("target_chat_id"):
         return
+    if not gc.get("my_account_id"):
+        return
+    anti = bool(gc.get("anti_dupe"))
+    if anti:
+        info = await cnl.get_dupe_db_info(owner_id) or {}
+        if not (info.get("enabled") and info.get("has_uri")):
+            anti = False  # require custom dupe DB
     rule = {
         "target_chat_id": int(gc["target_chat_id"]),
         "owner_id": owner_id,
@@ -467,8 +546,9 @@ async def process_global_copy(client: Client, message: Message, owner_id: int):
         "remove_links": gc.get("remove_links", False),
         "buttons": gc.get("buttons"),
         "delay": gc.get("delay") or 0,
-        "anti_dupe": gc.get("anti_dupe", False),
+        "anti_dupe": anti,
         "forward_tag": gc.get("forward_tag", False),
         "forward_via": "user_account",
+        "my_account_id": str(gc.get("my_account_id")),
     }
     await process_and_forward(client, message, rule, owner_id)
