@@ -71,21 +71,9 @@ def apply_caption_text(original: str, settings: Dict[str, Any]) -> Optional[str]
         caption = _apply_replacements_cnl_style(caption, replacements)
 
     if settings.get("remove_links", False):
-        caption = re.sub(
-            r"https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+|telegram\.dog/\S+",
-            "",
-            caption,
-            flags=re.IGNORECASE,
-        )
-        caption = re.sub(
-            r'<a\s+[^>]*href=["\'][^"\']+["\'][^>]*>(.*?)</a>',
-            r"\1",
-            caption,
-            flags=re.I | re.S,
-        )
-        caption = re.sub(r"\n{3,}", "\n\n", caption)
-        caption = re.sub(r"[ \t]{2,}", " ", caption)
-        caption = caption.strip()
+        # Same tested cleaner as CNL Auto Post (core/cnl/clean.py)
+        from core.cnl.clean import clean_file_name
+        caption = clean_file_name(caption) if caption else caption
 
     if settings.get("caption_enabled", False):
         template = settings.get("caption_template", "{caption}")

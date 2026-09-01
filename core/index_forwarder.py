@@ -147,7 +147,22 @@ async def run_index_forward(
         except Exception as e:
             logger.exception("Index forward crashed")
             try:
+                FWD_PROGRESS[user_id]["status"] = "error"
+            except Exception:
+                pass
+            try:
                 await status_message.edit_text(f"❌ Forward failed: {type(e).__name__}")
+            except Exception:
+                pass
+            try:
+                from core.log_chat import report_user_auto_stop
+                await report_user_auto_stop(
+                    user_id,
+                    feature="Index-Forward",
+                    title="Indexed media forward",
+                    reason="Index-forward stopped automatically after a crash.",
+                    error=f"{type(e).__name__}: {e}",
+                )
             except Exception:
                 pass
         finally:

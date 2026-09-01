@@ -4,22 +4,46 @@ from database import is_duplicate, mark_as_forwarded
 from core.filters import get_unique_file_id
 
 
+async def is_target_duplicate(
+    user_id: int,
+    target_chat_id: int,
+    message: Message,
+    anti_duplicate_enabled: bool,
+) -> bool:
+    """True = already on target — check only, does not claim."""
+    if not anti_duplicate_enabled:
+        return False
+    unique_id = get_unique_file_id(message)
+    if not unique_id:
+        return False
+    return await is_duplicate(user_id, target_chat_id, unique_id)
+
+
+async def mark_target_forwarded(
+    user_id: int,
+    target_chat_id: int,
+    message: Message,
+    anti_duplicate_enabled: bool,
+) -> None:
+    """Claim only after a successful send."""
+    if not anti_duplicate_enabled:
+        return
+    unique_id = get_unique_file_id(message)
+    if not unique_id:
+        return
+    await mark_as_forwarded(user_id, target_chat_id, unique_id)
+
+
 async def check_and_mark_duplicate(
     user_id: int,
     target_chat_id: int,
     message: Message,
     anti_duplicate_enabled: bool,
 ) -> bool:
-    """True = duplicate, skip send."""
-    if not anti_duplicate_enabled:
-        return False
+    """Legacy: check-only preferred path is is_target_duplicate + mark_target_forwarded.
 
-    unique_id = get_unique_file_id(message)
-    if not unique_id:
-        return False
-
-    if await is_duplicate(user_id, target_chat_id, unique_id):
-        return True
-
-    await mark_as_forwarded(user_id, target_chat_id, unique_id)
-    return False
+    Kept for any external callers — still check-only to avoid premature claims.
+    """
+    return await is_target_duplicate(
+        user_id, target_chat_id, message, anti_duplicate_enabled
+    )

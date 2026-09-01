@@ -33,6 +33,8 @@ DEFAULT_NORMAL_FEATURES = {
 }
 
 DEFAULT_NORMAL_LIMITS = {
+    "cnl_bots": 3,
+    "cnl_accounts": 3,
     "targets": 5,
     "wroxen": 5,
     "accounts": 5,
@@ -207,6 +209,14 @@ async def can_access_bot(user_id: int) -> bool:
     """May the user open /start at all?"""
     if is_owner(user_id) or is_config_admin(user_id):
         return True
+    try:
+        from database import db
+        doc = await db.db["bot_settings"].find_one({"_id": "main"}) or {}
+        banned = doc.get("banned_user_ids") or []
+        if int(user_id) in {int(x) for x in banned}:
+            return False
+    except Exception:
+        pass
     if await is_db_admin(user_id):
         return True
     return await normal_users_enabled()
@@ -227,3 +237,20 @@ FEATURE_ADMIN_PERM = {
     "settings": "manage_targets",
     "existing_forward": "manage_jobs",
 }
+
+
+async def is_user_banned(user_id: int) -> bool:
+    try:
+        from database import db
+        doc = await db.db["bot_settings"].find_one({"_id": "main"}) or {}
+        banned = doc.get("banned_user_ids") or []
+        return int(user_id) in {int(x) for x in banned}
+    except Exception:
+        return False
+
+
+async def can_access_bot_safe(user_id: int) -> bool:
+    """Access gate including ban list."""
+    if await is_user_banned(user_id):
+        return False
+    return await can_access_bot(user_id)

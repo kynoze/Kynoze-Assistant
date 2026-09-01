@@ -233,7 +233,23 @@ async def run_indexing(
         except Exception as e:
             logger.exception("Indexing crashed")
             try:
+                if user_id in INDEX_PROGRESS:
+                    INDEX_PROGRESS[user_id]["status"] = "error"
+            except Exception:
+                pass
+            try:
                 await status_message.edit_text(f"❌ Indexing failed: {type(e).__name__}")
+            except Exception:
+                pass
+            try:
+                from core.log_chat import report_user_auto_stop
+                await report_user_auto_stop(
+                    user_id,
+                    feature="Indexing",
+                    title=f"source `{source_chat_id}`",
+                    reason="Indexing stopped automatically after a crash.",
+                    error=f"{type(e).__name__}: {e}",
+                )
             except Exception:
                 pass
         finally:

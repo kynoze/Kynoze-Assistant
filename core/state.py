@@ -19,6 +19,10 @@ STATE_NAMES = (
     "wroxen_state",
     "delete_state",
     "cnl_state",
+    "log_chat_state",
+    "cnl_rvia_state",
+    "job_progress_ui_state",
+    "job_acc_state",
 )
 
 

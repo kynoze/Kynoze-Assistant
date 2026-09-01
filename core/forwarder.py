@@ -37,7 +37,9 @@ from database import (
     update_job,
     update_job_stats,
 )
-from core.anti_duplicate import check_and_mark_duplicate
+from core.anti_duplicate import is_target_duplicate, mark_target_forwarded
+from database import is_job_preindex_duplicate, mark_job_preindex_id
+from core.filters import get_unique_file_id
 from core.caption import build_inline_keyboard, process_caption
 from core.filters import should_process_message
 
@@ -49,6 +51,12 @@ PROGRESS_EVERY = 10  # update progress message every N fetched msgs
 
 
 async def _pause_for_accounts(user_id: int, job_id: str, detail: str):
+    from database import get_job
+    fresh = await get_job(user_id, job_id) or {}
+    if (fresh.get("status") or "").lower() == JobStatus.PAUSED.value and (
+        fresh.get("pause_reason") or ""
+    ) == "user":
+        return
     await update_job(
         user_id,
         job_id,
@@ -58,6 +66,21 @@ async def _pause_for_accounts(user_id: int, job_id: str, detail: str):
             "error_message": detail,
         },
     )
+    detail_l = (detail or "").lower()
+    if "sleep" in detail_l or "will auto-resume" in detail_l:
+        return
+    try:
+        from core.log_chat import report_user_auto_stop
+        job = await get_job(user_id, job_id) or {}
+        await report_user_auto_stop(
+            user_id,
+            feature="Jobs",
+            title=job.get("name") or job_id,
+            reason="Job automatically paused during forwarding — no usable user account.",
+            error=detail,
+        )
+    except Exception:
+        logger.exception("log-chat forwarder pause")
 
 
 class ForwardStats:
@@ -147,8 +170,9 @@ async def _send_text(
     Text posts: optional Telegram Rich Message (Bot API 10.1 / Kurigram send_rich_message).
     Media captions stay classic (1024 limit) — rich messages are a separate message type.
     """
+    text = (text or "").strip()
     if not text:
-        text = " "
+        raise ValueError("MESSAGE_EMPTY: nothing to send")
     if use_rich:
         try:
             from pyrogram.types import InputRichMessage
@@ -215,8 +239,12 @@ async def send_one(
         return
 
     text = final_caption if final_caption is not None else (message.text or message.caption or "")
+    text = (text or "").strip()
+    if not text:
+        # service/empty posts — do not send, not an account-limit count
+        return
     await _send_text(
-        client, target_chat_id, text or " ", reply_markup, use_rich=use_rich_message
+        client, target_chat_id, text, reply_markup, use_rich=use_rich_message
     )
 
 
@@ -247,6 +275,14 @@ async def forward_messages(
     delay = float(settings.get("delay", 1.0) or 0)
     forward_tag = bool(settings.get("forward_tag", False))
     anti_dup = settings.get("anti_duplicate", True)
+    job_preindex_enabled = False
+    if job_id:
+        try:
+            from database import get_job_by_id
+            _j = await get_job_by_id(job_id)
+            job_preindex_enabled = bool((_j or {}).get("pre_index_target_duplicates"))
+        except Exception:
+            job_preindex_enabled = False
 
     stats = ForwardStats()
     CANCEL = cancel_flag or {}
@@ -312,12 +348,22 @@ async def forward_messages(
                     )
                 continue
 
-            is_dup = await check_and_mark_duplicate(
-                user_id=user_id,
-                target_chat_id=target_chat_id,
-                message=message,
-                anti_duplicate_enabled=anti_dup,
-            )
+            # Order: filter already done → pre-index check → target anti-dupe CHECK
+            # → send → only then MARK target + job index (no premature claim)
+            is_dup = False
+            if job_id and job_preindex_enabled:
+                uid = get_unique_file_id(message)
+                if uid and await is_job_preindex_duplicate(
+                    job_id, uid, target_chat_id=target_chat_id
+                ):
+                    is_dup = True
+            if not is_dup:
+                is_dup = await is_target_duplicate(
+                    user_id=user_id,
+                    target_chat_id=target_chat_id,
+                    message=message,
+                    anti_duplicate_enabled=anti_dup,
+                )
             if is_dup:
                 stats.skipped_duplicate += 1
                 if job_id:
@@ -344,6 +390,49 @@ async def forward_messages(
                     use_rich_message=bool(settings.get("rich_message_enabled")),
                 )
                 stats.forwarded += 1
+
+                # Claim only after successful send
+                try:
+                    await mark_target_forwarded(
+                        user_id=user_id,
+                        target_chat_id=target_chat_id,
+                        message=message,
+                        anti_duplicate_enabled=anti_dup,
+                    )
+                except Exception:
+                    pass
+                if job_id and job_preindex_enabled:
+                    try:
+                        _uid = get_unique_file_id(message)
+                        if _uid:
+                            await mark_job_preindex_id(
+                                job_id, _uid,
+                                target_chat_id=target_chat_id,
+                                source_msg_id=message.id,
+                            )
+                    except Exception:
+                        pass
+
+                # CRITICAL: advance cursor BEFORE account sleep/rotate/pause.
+                # Otherwise resume re-sends the last successful message (duplicate).
+                # record_job_forward_tick also updates accurate Current/Avg/Peak speed.
+                if job_id:
+                    try:
+                        from database import record_job_forward_tick
+                        await record_job_forward_tick(
+                            user_id,
+                            job_id,
+                            current_msg_id=message.id,
+                            forwarded_delta=1,
+                            fetched_delta=1,
+                        )
+                    except Exception:
+                        await update_job_stats(
+                            user_id,
+                            job_id,
+                            {"fetched": 1, "forwarded": 1},
+                            current_msg_id=message.id,
+                        )
 
                 if current_account_id:
                     updated = await increment_account_forwarded(
@@ -375,14 +464,6 @@ async def forward_messages(
                                     f"**Paused** — all accounts sleeping\n\n{stats.summary()}",
                                 )
                                 return stats
-
-                if job_id:
-                    await update_job_stats(
-                        user_id,
-                        job_id,
-                        {"fetched": 1, "forwarded": 1},
-                        current_msg_id=message.id,
-                    )
                 await increment_stats(
                     user_id, "target", str(target_chat_id), {"forwarded": 1}
                 )
@@ -465,6 +546,19 @@ async def forward_messages(
         logger.exception("Forwarder crashed")
         if job_id:
             await set_job_status(user_id, job_id, JobStatus.FAILED.value, str(e))
+            try:
+                from core.log_chat import report_user_auto_stop
+                from database import get_job
+                job = await get_job(user_id, job_id) or {}
+                await report_user_auto_stop(
+                    user_id,
+                    feature="Jobs",
+                    title=job.get("name") or job_id,
+                    reason="Forwarder crashed. Job marked FAILED.",
+                    error=f"{type(e).__name__}: {e}",
+                )
+            except Exception:
+                pass
         await _edit_progress(
             progress_message,
             f"**Failed**\n\n{stats.summary()}\n\nError: `{e}`",

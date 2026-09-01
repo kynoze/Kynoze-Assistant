@@ -33,6 +33,7 @@ from database import (
     update_job,
     add_job_log,
     job_monitor_interval,
+    job_progress_ui_interval,
     JobStatus,
     AccountStatus,
     MethodType,
@@ -76,7 +77,37 @@ async def cancel_running_job(user_id: int, job_id: str) -> bool:
 CLIENTS: Dict[str, Client] = {}
 
 
+async def pause_running_job(user_id: int, job_id: str, reason: str = "user") -> bool:
+    """User (or system) pause: persist PAUSED and cancel in-memory worker task."""
+    try:
+        await update_job(
+            user_id,
+            job_id,
+            {
+                "status": JobStatus.PAUSED.value,
+                "pause_reason": reason,
+                "error_message": None if reason == "user" else None,
+            },
+        )
+    except Exception:
+        logger.exception("pause_running_job status update failed for %s", job_id)
+    task = RUNNING_JOB_TASKS.pop(job_id, None)
+    if task and not task.done():
+        task.cancel()
+        return True
+    return False
+
+
 async def pause_job_for_accounts(user_id: int, job_id: str, detail: str):
+    fresh = await get_job(user_id, job_id) or {}
+    # Never override intentional user pause
+    if (fresh.get("status") or "").lower() == JobStatus.PAUSED.value and (
+        fresh.get("pause_reason") or ""
+    ) == "user":
+        task = RUNNING_JOB_TASKS.pop(job_id, None)
+        if task and not task.done():
+            task.cancel()
+        return
     await update_job(
         user_id,
         job_id,
@@ -86,6 +117,25 @@ async def pause_job_for_accounts(user_id: int, job_id: str, detail: str):
             "error_message": detail,
         },
     )
+    task = RUNNING_JOB_TASKS.pop(job_id, None)
+    if task and not task.done():
+        task.cancel()
+    detail_l = (detail or "").lower()
+    # Expected sleep auto-pause — no log-chat spam
+    if "sleep" in detail_l or "will auto-resume" in detail_l:
+        return
+    try:
+        from core.log_chat import report_user_auto_stop
+        job = await get_job(user_id, job_id) or {}
+        await report_user_auto_stop(
+            user_id,
+            feature="Jobs",
+            title=job.get("name") or job_id,
+            reason="Job automatically paused — no usable user account (disabled / session dead).",
+            error=detail,
+        )
+    except Exception:
+        logger.exception("log-chat job pause report")
 
 
 async def resume_jobs_waiting_on_accounts() -> int:
@@ -134,8 +184,94 @@ async def resume_jobs_waiting_on_accounts() -> int:
     return resumed
 
 
+
+
+async def progress_ui_refresh_loop(app: Client):
+    """Edit bound job progress messages on user interval (1m–1d, default 5m)."""
+    from datetime import datetime, timezone
+    from handlers.jobs_handlers import job_detail_text, job_controls_keyboard
+    while True:
+        try:
+            await asyncio.sleep(60)
+            now = datetime.now(timezone.utc)
+            try:
+                jobs = await db.forward_jobs.find({
+                    "status": JobStatus.RUNNING.value,
+                    "progress_message_id": {"$ne": None},
+                    "progress_chat_id": {"$ne": None},
+                }).to_list(200)
+            except Exception:
+                continue
+            for job in jobs:
+                try:
+                    interval = job_progress_ui_interval(job)
+                    last = job.get("progress_ui_last_at")
+                    if last is not None and getattr(last, "tzinfo", None) is None:
+                        last = last.replace(tzinfo=timezone.utc)
+                    if last and (now - last).total_seconds() < interval:
+                        continue
+                    # first bind: wait full interval unless never refreshed
+                    bound = job.get("progress_ui_bound_at")
+                    if last is None and bound is not None:
+                        if getattr(bound, "tzinfo", None) is None:
+                            bound = bound.replace(tzinfo=timezone.utc)
+                        if (now - bound).total_seconds() < interval:
+                            continue
+                    chat_id = job.get("progress_chat_id")
+                    msg_id = job.get("progress_message_id")
+                    user_id = job.get("user_id")
+                    job_id = job.get("job_id")
+                    if not chat_id or not msg_id or not user_id or not job_id:
+                        continue
+                    fresh = await get_job(user_id, job_id) or job
+                    if (fresh.get("status") or "").lower() != JobStatus.RUNNING.value:
+                        continue
+                    text = job_detail_text(fresh)
+                    from handlers.ui import fmt_interval
+                    text += (
+                        f"\n\n⏱ **Progress auto-update:** "
+                        f"`{fmt_interval(job_progress_ui_interval(fresh))}` "
+                        f"(auto · 30m–1d)"
+                    )
+                    try:
+                        await app.edit_message_text(
+                            chat_id,
+                            int(msg_id),
+                            text,
+                            reply_markup=job_controls_keyboard(fresh),
+                        )
+                    except Exception as e:
+                        # message deleted / not modified — unbind on hard failure
+                        err = str(e).lower()
+                        if "message" in err and ("not" in err or "modify" in err or "id" in err):
+                            await update_job(user_id, job_id, {
+                                "progress_message_id": None,
+                                "progress_chat_id": None,
+                            })
+                        continue
+                    await update_job(user_id, job_id, {"progress_ui_last_at": now})
+                except Exception:
+                    logger.exception("progress_ui refresh one job")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("progress_ui_refresh_loop")
+
 async def job_worker_loop(_management_client=None):
     logger.info("Job worker started (selected bot / user accounts only).")
+    try:
+        active = await get_active_jobs()
+        running_n = sum(
+            1 for j in (active or [])
+            if (j.get("status") or "").lower() == JobStatus.RUNNING.value
+        )
+        if running_n:
+            logger.info(
+                "Boot: %s job(s) still RUNNING in DB — will resume automatically",
+                running_n,
+            )
+    except Exception:
+        logger.exception("Boot job inventory failed")
     while True:
         try:
             woken = await wake_sleeping_accounts()
@@ -259,25 +395,32 @@ async def get_new_client_for_rotation(
     strategy: str,
     exclude_id: Optional[str] = None,
 ) -> Tuple[Optional[Client], Optional[str]]:
+    """Next account in job order: 1→2→3→4→1… Skip sleeping/unavailable."""
     await wake_sleeping_accounts(user_id)
-    available = []
-    from database import get_available_accounts
+    from database import get_account
+    from database import AccountStatus
 
-    for acc in await get_available_accounts(user_id, account_ids):
-        if exclude_id and acc["account_id"] == exclude_id:
+    ids = [str(a) for a in (account_ids or [])]
+    if not ids:
+        return None, None
+
+    # sequential cycle after current
+    if exclude_id and str(exclude_id) in ids:
+        i = ids.index(str(exclude_id))
+        ordered = ids[i + 1 :] + ids[:i]
+    else:
+        ordered = list(ids)
+
+    # if strategy ever non-sequential, still prefer ordered list
+    for aid in ordered:
+        acc = await get_account(user_id, aid)
+        if not acc:
             continue
-        available.append(acc)
-
-    if not available:
-        account = await get_next_available_account(user_id, account_ids, strategy)
-        if not account or account.get("account_id") == exclude_id:
-            return None, None
-        available = [account]
-
-    for account in available:
-        client = await get_user_client(account)
+        if acc.get("status") != AccountStatus.ACTIVE.value:
+            continue
+        client = await get_user_client(acc)
         if client:
-            return client, account["account_id"]
+            return client, aid
     return None, None
 
 
@@ -313,6 +456,42 @@ async def resolve_exec_client(job: dict) -> Tuple[Optional[Client], Optional[str
 async def job_still_running(user_id: int, job_id: str) -> bool:
     fresh = await get_job(user_id, job_id)
     return bool(fresh and fresh.get("status") == JobStatus.RUNNING.value)
+
+
+async def _bump_progress_cursor(user_id: int, job_id: str, msg_id: int, **extra):
+    """Advance current_msg_id / high_water_msg_id upward only (never backwards)."""
+    fresh = await get_job(user_id, job_id) or {}
+    skip = int(fresh.get("skip") or 0)
+    prev = int(fresh.get("current_msg_id") or 0)
+    hw = int(fresh.get("high_water_msg_id") or 0)
+    mid = int(msg_id or 0)
+    new_cur = max(prev, mid, skip)
+    new_hw = max(hw, new_cur, skip)
+    payload = {"current_msg_id": new_cur, "high_water_msg_id": new_hw}
+    payload.update(extra)
+    await update_job(user_id, job_id, payload)
+
+
+def historical_range_complete(job: dict) -> bool:
+    """True when every target has finished the historical msg-id range.
+
+    New-post monitoring must only run after this is True.
+    """
+    targets = list(job.get("target_chat_ids") or [])
+    t_idx = int(job.get("current_target_index") or 0)
+    last_id = int(job.get("last_msg_id") or 0)
+    skip = int(job.get("skip") or 0)
+    # No targets or empty range → nothing historical left
+    if not targets:
+        return True
+    if last_id <= skip:
+        return True
+    # forward_job_range advances current_target_index past the last target when done
+    if t_idx >= len(targets):
+        return True
+    return False
+
+
 
 
 async def _probe_latest_after(
@@ -399,18 +578,47 @@ async def run_single_job(job: dict):
             logger.warning("Job %s paused: %s", job_id, err)
             return
 
+        # ── Pre-Index Target Duplicates (optional, before any forward) ──
+        if bool(job.get("pre_index_target_duplicates")) and job.get("pre_index_status") != "done":
+            from core.job_preindex import preindex_job_targets
+            logger.info("Job %s pre-indexing target media…", job_id)
+            ok, msg, count = await preindex_job_targets(client, user_id, job)
+            if not ok:
+                logger.error("Job %s pre-index failed: %s", job_id, msg)
+                try:
+                    from core.log_chat import report_user_auto_stop
+                    await report_user_auto_stop(
+                        user_id,
+                        feature="Jobs / Pre-Index",
+                        title=job.get("name") or job_id,
+                        reason="Pre-index of target duplicates failed. Forwarding did not start.",
+                        error=msg,
+                    )
+                except Exception:
+                    pass
+                return
+            logger.info("Job %s pre-index done (%s ids) — starting forward", job_id, count)
+            await set_job_status(user_id, job_id, JobStatus.RUNNING.value)
+            job = await get_job(user_id, job_id) or job
+
         async def rotation_cb(uid, ids, strat):
+            # Live account list — user can add/remove mid-job
+            fresh_job = await get_job(uid, job_id) or {}
+            live_ids = list(fresh_job.get("account_ids") or ids or [])
             return await get_new_client_for_rotation(
-                uid, ids, strat, exclude_id=current_account_id
+                uid, live_ids, strat, exclude_id=current_account_id
             )
 
-        if last_msg_id > skip:
+        targets = job.get("target_chat_ids") or []
+        t_idx = int(job.get("current_target_index") or 0)
+        # Historical range: run until every target is finished
+        if t_idx < len(targets) and last_msg_id > int(job.get("skip") or 0):
             await forward_job_range(
                 job=job,
                 client=client,
                 current_account_id=current_account_id,
                 rotation_cb=rotation_cb,
-                start_id=skip,
+                start_id=int(job.get("skip") or 0),
                 end_id=last_msg_id,
             )
 
@@ -418,26 +626,114 @@ async def run_single_job(job: dict):
             return
 
         fresh = await get_job(user_id, job_id) or job
+        t_idx = int(fresh.get("current_target_index") or 0)
+        targets = fresh.get("target_chat_ids") or targets
         future = bool(fresh.get("future_new_posts"))
-        if not future:
-            await set_job_status(user_id, job_id, JobStatus.COMPLETED.value)
-            logger.info("Job %s completed", job_id)
+        if t_idx < len(targets) and last_msg_id > int(fresh.get("skip") or 0):
+            # Still incomplete targets (e.g. paused) — do not mark complete
+            return
+        if not historical_range_complete(fresh):
+            # Historical still open (paused mid-range, etc.) — do not monitor yet
+            logger.info(
+                "Job %s historical incomplete (t_idx=%s) — skip monitor",
+                job_id,
+                fresh.get("current_target_index"),
+            )
             return
 
-        logger.info("Job %s entering future-post monitor", job_id)
+        if not future:
+            await set_job_status(user_id, job_id, JobStatus.COMPLETED.value)
+            logger.info("Job %s completed (no future monitoring)", job_id)
+            try:
+                from core.log_chat import report_user_job_complete
+                fresh = await get_job(user_id, job_id) or job
+                stats = fresh.get("stats") or {}
+                st = (
+                    f"Fetched: `{stats.get('fetched', 0)}`\n"
+                    f"Forwarded: `{stats.get('forwarded', 0)}`\n"
+                    f"Errors: `{stats.get('errors', 0)}`"
+                )
+                await report_user_job_complete(
+                    user_id,
+                    title=fresh.get("name") or job_id,
+                    stats_text=st,
+                )
+            except Exception:
+                logger.exception("job complete log-chat")
+            return
+
+        # Historical done + monitoring ON + still RUNNING → log, then live new-post phase
+        await _bump_progress_cursor(
+            user_id, job_id, int(fresh.get("last_msg_id") or 0),
+            job_phase="monitoring",
+            current_target_index=len(list(fresh.get("target_chat_ids") or [])),
+        )
+        try:
+            from core.log_chat import report_user_job_complete
+            stats = (fresh.get("stats") or {})
+            await report_user_job_complete(
+                user_id,
+                title=fresh.get("name") or job_id,
+                stats_text=(
+                    f"Historical range **complete**.\n"
+                    f"Fetched: `{stats.get('fetched', 0)}` · "
+                    f"Forwarded: `{stats.get('forwarded', 0)}`\n"
+                    f"Now **listing / monitoring** for new posts."
+                ),
+                extra="Future New Posts is ON — job stays Running.",
+            )
+        except Exception:
+            logger.exception("historical-complete log-chat")
+        logger.info("Job %s historical done — entering future-post monitor", job_id)
         await monitor_future_posts(
-            job=job,
+            job=fresh,
             client=client,
             current_account_id=current_account_id,
             rotation_cb=rotation_cb,
         )
 
     except asyncio.CancelledError:
+        fresh = await get_job(user_id, job_id) or {}
+        pr = (fresh.get("pause_reason") or "")
+        st = (fresh.get("status") or "").lower()
+        # User pause / account sleep already set PAUSED — do not mark cancelled
+        if st == JobStatus.PAUSED.value or pr in ("user", PAUSE_REASON_ACCOUNTS):
+            logger.info("Job %s worker stopped (paused reason=%s)", job_id, pr or st)
+            RUNNING_JOB_TASKS.pop(job_id, None)
+            return
         await set_job_status(user_id, job_id, JobStatus.CANCELLED.value)
         logger.info("Job %s cancelled", job_id)
+        if pr not in ("user", "deleted_or_stopped", PAUSE_REASON_ACCOUNTS):
+            try:
+                from core.log_chat import report_user_auto_stop
+                await report_user_auto_stop(
+                    user_id,
+                    feature="Jobs",
+                    title=fresh.get("name") or job_id,
+                    reason="Job task was cancelled by the system (not a user Stop tap).",
+                    error=pr or "CancelledError",
+                )
+            except Exception:
+                pass
     except Exception as e:
         logger.exception("Job %s crashed", job_id)
         await set_job_status(user_id, job_id, JobStatus.FAILED.value, "Internal error — check logs")
+        try:
+            from core.log_chat import report_user_auto_stop, report_owner
+            await report_user_auto_stop(
+                user_id,
+                feature="Jobs",
+                title=job.get("name") or job_id,
+                reason="Job crashed and was marked FAILED.",
+                error=f"{type(e).__name__}: {e}",
+            )
+            await report_owner(
+                "ERROR",
+                f"Job crashed: {job.get('name') or job_id}",
+                f"user={user_id} job={job_id}\n{type(e).__name__}: {e}",
+            )
+        except Exception:
+            pass
     finally:
         RUNNING_JOB_TASKS.pop(job_id, None)
 
@@ -450,21 +746,76 @@ async def forward_job_range(
     start_id: int,
     end_id: int,
 ) -> int:
-    """Forward range for all targets. Returns total successfully forwarded count."""
+    """Forward range target-by-target (complete one before the next).
+
+    Progress is tracked with:
+      - current_target_index: index into target_chat_ids
+      - current_msg_id: last completed source message id *within that target*
+    On resume after account sleep, only the active target continues from current_msg_id.
+    Finished targets are not restarted from the shared cursor.
+    """
     user_id = job["user_id"]
     job_id = job["job_id"]
     source_chat_id = job.get("source_chat_id")
     account_ids = job.get("account_ids") or []
     strategy = job.get("account_strategy", "sequential")
+    # window_start: historical job.skip OR future-monitor cursor (start_id)
+    window_start = int(start_id) if start_id is not None else int(job.get("skip") or 0)
+    base_skip = window_start
+    targets = [int(t) for t in (job.get("target_chat_ids") or [])]
     total_forwarded = 0
 
-    for target_chat_id in job.get("target_chat_ids") or []:
+    if not targets:
+        return 0
+
+    # Refresh progress from DB (may have advanced during prior partial run)
+    fresh = await get_job(user_id, job_id) or job
+    t_idx = int(fresh.get("current_target_index") or 0)
+    if t_idx < 0:
+        t_idx = 0
+
+    for i in range(t_idx, len(targets)):
         if not await job_still_running(user_id, job_id):
             return total_forwarded
 
+        fresh = await get_job(user_id, job_id) or job
+        # Another worker may have moved the index
+        db_idx = int(fresh.get("current_target_index") or 0)
+        if db_idx > i:
+            continue
+        if db_idx < i:
+            # Align DB to this target
+            await update_job(user_id, job_id, {"current_target_index": i})
+
+        target_chat_id = targets[i]
         target = await get_target(user_id, target_chat_id)
         if not target:
+            await _bump_progress_cursor(
+                user_id, job_id, base_skip, current_target_index=i + 1,
+            )
             continue
+
+        # Active target: resume from current_msg_id; ensure index is set
+        fresh = await get_job(user_id, job_id) or job
+        if int(fresh.get("current_target_index") or 0) != i:
+            await update_job(user_id, job_id, {"current_target_index": i})
+            msg_skip = base_skip
+        else:
+            cur = fresh.get("current_msg_id")
+            msg_skip = int(cur) if cur is not None else base_skip
+
+        if end_id <= msg_skip:
+            # Range already done for this target — advance index, keep watermark high
+            await _bump_progress_cursor(
+                user_id, job_id, max(end_id, msg_skip, base_skip),
+                current_target_index=i + 1,
+            )
+            continue
+
+        logger.info(
+            "Job %s target %s/%s chat=%s resume=%s → %s",
+            job_id, i + 1, len(targets), target_chat_id, msg_skip, end_id,
+        )
 
         stats = await forward_messages(
             client=client,
@@ -472,7 +823,7 @@ async def forward_job_range(
             source_chat_id=source_chat_id,
             target=target,
             last_msg_id=end_id,
-            skip=start_id,
+            skip=msg_skip,
             job_id=job_id,
             account_id=current_account_id,
             account_ids=account_ids,
@@ -483,6 +834,20 @@ async def forward_job_range(
         )
         if stats is not None:
             total_forwarded += int(getattr(stats, "forwarded", 0) or 0)
+
+        # Paused mid-target (accounts sleeping) — keep current_target_index=i
+        if not await job_still_running(user_id, job_id):
+            return total_forwarded
+
+        # Target fully done → pin watermark at end_id (never drop to base_skip)
+        # Next target resumes from base_skip via msg_skip logic, but high_water stays high.
+        next_idx = i + 1
+        await _bump_progress_cursor(
+            user_id, job_id, end_id,
+            current_target_index=next_idx,
+        )
+        logger.info("Job %s finished target %s/%s", job_id, i + 1, len(targets))
+
     return total_forwarded
 
 
@@ -500,19 +865,42 @@ async def monitor_future_posts(job: dict, client: Client, current_account_id, ro
     source_chat_id = job.get("source_chat_id")
 
     while True:
+        # Must stay RUNNING — pause/stop ends monitoring immediately
         if not await job_still_running(user_id, job_id):
+            logger.info("Job %s monitor exit — not running", job_id)
             return
 
         fresh = await get_job(user_id, job_id)
         if not fresh:
             return
+        # Historical must be complete (never monitor mid-range)
+        if not historical_range_complete(fresh):
+            logger.info("Job %s monitor exit — historical incomplete", job_id)
+            return
+        # Monitoring toggle must stay ON
         if not fresh.get("future_new_posts"):
             await set_job_status(user_id, job_id, JobStatus.COMPLETED.value)
             logger.info("Job %s future posts turned OFF — completed", job_id)
+            try:
+                from core.log_chat import report_user_job_complete
+                await report_user_job_complete(
+                    user_id,
+                    title=fresh.get("name") or job_id,
+                    stats_text="Future monitoring turned OFF — historical range done.",
+                )
+            except Exception:
+                pass
             return
 
         interval = job_monitor_interval(fresh)
-        cursor = int(fresh.get("current_msg_id") or fresh.get("last_msg_id") or 0)
+        targets = list(fresh.get("target_chat_ids") or [])
+        t_idx = int(fresh.get("current_target_index") or 0)
+        skip = int(fresh.get("skip") or 0)
+        cursor = int(fresh.get("current_msg_id") or 0)
+        hw = int(fresh.get("high_water_msg_id") or 0)
+        last_done = int(fresh.get("last_msg_id") or 0)
+        # High-water mark: never go backwards into already-finished IDs
+        cursor = max(cursor, hw, last_done, skip)
         method = fresh.get("method")
         latest = await latest_source_message_id(
             client, source_chat_id, after_id=cursor, method=method
@@ -532,12 +920,21 @@ async def monitor_future_posts(job: dict, client: Client, current_account_id, ro
             continue
 
         if latest > cursor:
-            logger.info("Job %s new posts %s → %s", job_id, cursor + 1, latest)
-            try:
-                await add_job_log(job_id, "info", f"New posts detected {cursor + 1} → {latest}")
-            except Exception:
-                pass
-            await update_job(user_id, job_id, {"last_msg_id": latest})
+            logger.debug("Job %s new posts %s → %s", job_id, cursor + 1, latest)
+            # New-post window only — do NOT restart from original skip
+            n_targets = len(targets)
+            await update_job(
+                user_id,
+                job_id,
+                {
+                    "last_msg_id": latest,
+                    "current_target_index": 0,
+                    "current_msg_id": cursor,
+                    "monitor_window_start": cursor,
+                    "job_phase": "monitoring",
+                },
+            )
+            fresh = await get_job(user_id, job_id) or fresh
             forwarded_n = await forward_job_range(
                 job=fresh,
                 client=client,
@@ -546,7 +943,17 @@ async def monitor_future_posts(job: dict, client: Client, current_account_id, ro
                 start_id=cursor,
                 end_id=latest,
             )
-            # Count only successfully forwarded messages, not id delta
+            # Window done: park cursor at latest and mark all targets complete
+            # (t_idx=0 after a window was wrongly treated as "historical incomplete")
+            still = await job_still_running(user_id, job_id)
+            if still:
+                await _bump_progress_cursor(
+                    user_id, job_id, latest,
+                    last_msg_id=latest,
+                    current_target_index=n_targets if n_targets else 0,
+                    monitor_window_start=None,
+                    job_phase="monitoring",
+                )
             if forwarded_n:
                 try:
                     fresh2 = await get_job(user_id, job_id) or fresh
@@ -558,9 +965,14 @@ async def monitor_future_posts(job: dict, client: Client, current_account_id, ro
                             + int(forwarded_n),
                         },
                     )
-                    await add_job_log(job_id, "info", f"Forwarded {forwarded_n} new post(s)")
+                    pass  # quiet: no per-batch forward log
                 except Exception:
                     pass
+            elif still:
+                logger.warning(
+                    "Job %s detected %s→%s but forwarded 0 (check accounts/filters)",
+                    job_id, cursor + 1, latest,
+                )
         await asyncio.sleep(interval)
 
 
