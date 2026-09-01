@@ -187,7 +187,7 @@ async def run_delete_job(
         return stats
 
     ok, reason = await check_delete_permissions(
-        client, chat_id, account.get("name") or account_id
+        client, chat_id, account.get("name") or account_id, m_user_id=int(user_id)
     )
     if not ok:
         stats["status"] = "failed"
@@ -337,3 +337,17 @@ async def _persist_error(user_id: int, config_id: str, error: str, pause_auto: b
         updates["auto_delete"] = False
         updates["enabled"] = True
     await update_delete_config(user_id, config_id, updates)
+    if pause_auto:
+        try:
+            from core.log_chat import report_user_auto_stop
+            from database import get_delete_config
+            cfg = await get_delete_config(user_id, config_id) or {}
+            await report_user_auto_stop(
+                user_id,
+                feature="Delete Manager",
+                title=cfg.get("target_title") or str(cfg.get("target_chat_id") or config_id),
+                reason="Auto-delete was paused automatically (permission / session / error).",
+                error=error,
+            )
+        except Exception:
+            logger.exception("log-chat delete persist")

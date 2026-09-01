@@ -74,3 +74,14 @@ async def _run_auto(cfg: dict):
                 "next_run_at": _next_run(int(cfg.get("check_interval_seconds") or 86400)),
             },
         )
+        try:
+            from core.log_chat import report_user_auto_stop
+            await report_user_auto_stop(
+                user_id,
+                feature="Delete Manager",
+                title=cfg.get("target_title") or str(cfg.get("target_chat_id") or cid),
+                reason="Auto-delete crashed and was turned OFF.",
+                error="Auto-delete stopped after an error. See bot logs.",
+            )
+        except Exception:
+            pass
