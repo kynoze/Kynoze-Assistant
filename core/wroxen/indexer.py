@@ -129,6 +129,9 @@ async def run_initial_index(
     async with lock:
         CANCEL[owner_user_id] = False
         start = time.time()
+        range_start = max(skip, 0)
+        end_id = int(last_msg_id)
+        total_est = max(0, end_id - range_start)
         PROGRESS[owner_user_id] = {
             "status": "running",
             "processed": 0,
@@ -138,17 +141,48 @@ async def run_initial_index(
             "errors": 0,
             "start_time": start,
             "wroxen_id": wroxen_id,
+            "current_id": range_start,
+            "end_id": end_id,
+            "range_start": range_start,
+            "total_est": total_est,
+            "pct": 0,
         }
-        current = max(skip, 0)
-        end_id = last_msg_id
+        current = range_start
         BATCH = 80
+        last_ui = 0.0
+
+        async def _maybe_ui(force: bool = False):
+            nonlocal last_ui
+            now = time.time()
+            if not force and (now - last_ui) < 2.5:
+                return
+            last_ui = now
+            p = PROGRESS.get(owner_user_id) or {}
+            p["elapsed"] = now - start
+            done = max(0, current - range_start)
+            p["pct"] = int(min(99, round(100.0 * done / total_est))) if total_est else 0
+            p["current_id"] = current
+            try:
+                from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Refresh", callback_data="wx:idx_prog")],
+                    [InlineKeyboardButton("❌ Stop", callback_data="wx:idx_stop")],
+                ])
+                await status_message.edit_text(_fmt(p), reply_markup=kb)
+            except Exception:
+                try:
+                    await status_message.edit_text(_fmt(p))
+                except Exception:
+                    pass
 
         try:
             if current >= end_id:
                 PROGRESS[owner_user_id]["status"] = "done"
+                PROGRESS[owner_user_id]["pct"] = 100
                 await status_message.edit_text("⚠️ No messages in range.")
                 return
 
+            await _maybe_ui(force=True)
             while current < end_id:
                 if CANCEL.get(owner_user_id):
                     PROGRESS[owner_user_id]["status"] = "cancelled"
@@ -166,11 +200,13 @@ async def run_initial_index(
                 except RPCError:
                     PROGRESS[owner_user_id]["errors"] += len(ids)
                     current = batch_end
+                    await _maybe_ui()
                     continue
                 except Exception:
                     logger.exception("wroxen get_messages")
                     PROGRESS[owner_user_id]["errors"] += len(ids)
                     current = batch_end
+                    await _maybe_ui()
                     continue
 
                 if not isinstance(messages, list):
@@ -199,26 +235,47 @@ async def run_initial_index(
                         PROGRESS[owner_user_id]["errors"] += 1
 
                 current = batch_end
+                PROGRESS[owner_user_id]["current_id"] = current
+                await _maybe_ui()
                 await asyncio.sleep(0.05)
 
             p = PROGRESS[owner_user_id]
             if p.get("status") == "running":
                 p["status"] = "done"
+                p["pct"] = 100
             p["elapsed"] = time.time() - start
-            try:
-                await status_message.edit_text(_fmt(p))
-            except Exception:
-                pass
+            p["current_id"] = current
+            await _maybe_ui(force=True)
         except Exception as e:
             logger.exception("wroxen initial index failed")
+            if owner_user_id in PROGRESS:
+                PROGRESS[owner_user_id]["status"] = "error"
             try:
-                await status_message.edit_text(f"❌ Index failed: {type(e).__name__}")
+                await status_message.edit_text(f"❌ Index failed: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            try:
+                from core.log_chat import report_user_auto_stop
+                await report_user_auto_stop(
+                    owner_user_id,
+                    feature="Wroxen Search",
+                    title=f"wroxen `{wroxen_id}`",
+                    reason="Wroxen indexing stopped automatically after a crash.",
+                    error=f"{type(e).__name__}: {e}",
+                )
             except Exception:
                 pass
         finally:
-            await asyncio.sleep(1)
+            # Keep progress ~2 min so Refresh/Stop still work after finish
+            await asyncio.sleep(120)
             PROGRESS.pop(owner_user_id, None)
             CANCEL.pop(owner_user_id, None)
+
+
+def _bar(pct: int) -> str:
+    pct = max(0, min(100, int(pct or 0)))
+    filled = pct // 10
+    return "█" * filled + "░" * (10 - filled)
 
 
 def _fmt(p: Dict[str, Any]) -> str:
@@ -228,15 +285,27 @@ def _fmt(p: Dict[str, Any]) -> str:
         "running": "📥 Wroxen Indexing...",
         "cancelled": "🛑 Wroxen index cancelled",
         "done": "🎉 Wroxen index completed",
+        "error": "❌ Wroxen index failed",
     }.get(status, "📥 Wroxen Indexing...")
+    pct = int(p.get("pct") or 0)
+    cur = int(p.get("current_id") or 0)
+    end = int(p.get("end_id") or 0)
+    start_id = int(p.get("range_start") or 0)
+    speed = 0.0
+    if elapsed > 1:
+        speed = float(p.get("processed") or 0) / elapsed
     return (
         f"**{title}**\n\n"
+        f"`{_bar(pct)}` **{pct}%**\n"
+        f"Cursor: `#{cur:,}` / `#{end:,}` (from `#{start_id:,}`)\n\n"
         f"Processed: **{p.get('processed', 0):,}**\n"
         f"Indexed: **{p.get('indexed', 0):,}**\n"
         f"Duplicates: **{p.get('duplicates', 0):,}**\n"
         f"Skipped: **{p.get('skipped', 0):,}**\n"
         f"Errors: **{p.get('errors', 0):,}**\n"
-        f"Runtime: **{int(elapsed // 60)}m {int(elapsed % 60)}s**"
+        f"Speed: **{speed:.1f} msg/s**\n"
+        f"Runtime: **{int(elapsed // 60)}m {int(elapsed % 60)}s**\n\n"
+        f"_Tap Refresh for latest · Stop to cancel_"
     )
 
 

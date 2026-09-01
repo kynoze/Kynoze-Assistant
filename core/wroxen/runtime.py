@@ -126,9 +126,10 @@ async def start_bot_for_config(cfg: Dict[str, Any]) -> Optional[Client]:
                 if bid != bot_id:
                     continue
                 # ensure DB
-                from database import get_wroxen_db_uri_plain
+                from core.db_resolver import resolve_feature_db
+                resolved = await resolve_feature_db(owner_uid, "wroxen")
+                uri = resolved.get("uri")
 
-                uri = await get_wroxen_db_uri_plain(owner_uid)
                 if not uri:
                     continue
                 ok, _ = await wxdb.ensure_connected(owner_uid, uri)
@@ -156,9 +157,10 @@ async def start_bot_for_config(cfg: Dict[str, Any]) -> Optional[Client]:
             return
         owner_uid, wroxen_id, _ = matched[0]
         try:
-            from database import get_wroxen_db_uri_plain
+            from core.db_resolver import resolve_feature_db
+            resolved = await resolve_feature_db(owner_uid, "wroxen")
+            uri = resolved.get("uri")
 
-            uri = await get_wroxen_db_uri_plain(owner_uid)
             if not uri:
                 return
             ok, _ = await wxdb.ensure_connected(owner_uid, uri)
@@ -270,6 +272,17 @@ async def start_bot_for_config(cfg: Dict[str, Any]) -> Optional[Client]:
         return client
     except Exception:
         logger.exception("Failed to start Wroxen bot %s", bot_id)
+        try:
+            from core.log_chat import report_user_auto_stop
+            await report_user_auto_stop(
+                owner,
+                feature="Wroxen Search",
+                title=cfg.get("name") or bot_id,
+                reason="Wroxen bot client failed to start. Search/auto-index is stopped.",
+                error="client.start failed — see bot logs",
+            )
+        except Exception:
+            pass
         return None
 
 

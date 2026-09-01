@@ -17,8 +17,9 @@ CACHE_TTL = 300
 
 
 def _cache_key(wroxen_id: str, query: str) -> str:
-    raw = f"{wroxen_id}:{query.strip().lower()}"
-    return "wx:" + hashlib.md5(raw.encode()).hexdigest()
+    # Prefix with wroxen_id so we can clear one Wroxen without wiping all caches
+    qh = hashlib.md5(query.strip().lower().encode()).hexdigest()
+    return f"wx:{wroxen_id}:{qh}"
 
 
 def get_cached(wroxen_id: str, query: str) -> Optional[Tuple[List[Dict], int]]:
@@ -43,10 +44,21 @@ def set_cached(wroxen_id: str, query: str, results: List[Dict], total: int) -> N
             _CACHE.pop(k, None)
 
 
-def clear_cache_for_wroxen(wroxen_id: str) -> None:
-    prefix_check = wroxen_id  # keys are hashed; clear all is safer on reindex
-    # Clear entire cache on clear/reindex for simplicity
+
+def clear_cache_for_wroxen(wroxen_id: str) -> int:
+    """Clear only this Wroxen's search cache (does not touch other Wroxens)."""
+    prefix = f"wx:{wroxen_id}:"
+    removed = 0
+    for k in list(_CACHE.keys()):
+        if k.startswith(prefix):
+            _CACHE.pop(k, None)
+            removed += 1
+    return removed
+
+
+def clear_cache() -> None:
     _CACHE.clear()
+
 
 
 def format_result_line(i: int, movie: Dict[str, Any]) -> str:
