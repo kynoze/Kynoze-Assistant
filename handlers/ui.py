@@ -2,10 +2,25 @@
 
 from __future__ import annotations
 
+# Link preview: prefer link_preview_options (new Pyrogram/Kurigram),
+# never pass deprecated disable_web_page_preview.
+
 from datetime import datetime, timezone
 from typing import Any, List, Optional, Sequence, Tuple
 
 PAGE_SIZE = 8
+
+def no_link_preview_kwargs() -> dict:
+    """Kwargs to disable link preview without deprecated disable_web_page_preview."""
+    try:
+        from pyrogram.types import LinkPreviewOptions
+        return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
+    except Exception:
+        try:
+            return {"link_preview_options": {"is_disabled": True}}
+        except Exception:
+            return {}
+
 HR = ""  # separators removed per UI request
 
 STATUS_ICON = {

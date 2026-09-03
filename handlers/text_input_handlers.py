@@ -89,8 +89,20 @@ async def handle_all_text_input(client: Client, message: Message):
                 "Minimum **5 minutes** for normal users. Owner/admin can use 1 or 2."
             )
         seconds = clamp_progress_ui_interval(raw_sec, allow_fast=_priv)
-        job_id = pui["job_id"]
-        await update_job(_uid, job_id, {"progress_ui_interval_seconds": seconds})
+        from datetime import datetime, timezone
+        bind = {}
+        if pui.get("chat_id") and pui.get("message_id"):
+            bind = {
+                "progress_chat_id": pui["chat_id"],
+                "progress_message_id": pui["message_id"],
+                "progress_ui_bound_at": datetime.now(timezone.utc),
+                "progress_ui_last_at": None,
+            }
+        await update_job(_uid, job_id, {
+            "progress_ui_interval_seconds": seconds,
+            "progress_ui_enabled": True,
+            **bind,
+        })
         set_state(client, "job_progress_ui_state", _uid, None)
         await message.reply(
             f"✅ Progress auto-update set to **{fmt_interval(seconds)}** for this job."
@@ -202,82 +214,46 @@ async def handle_all_text_input(client: Client, message: Message):
             return await message.reply("Send a number. Example: `0` or `100`")
 
         source_chat_id = forward_state["source_chat_id"]
-        last_msg_id = int(forward_state["last_msg_id"])
-        if skip >= last_msg_id:
+        last_msg_id = int(forward_state.get("last_msg_id") or 0)
+        if last_msg_id and skip >= last_msg_id:
             return await message.reply(
-                f"Skip must be less than last message id `{last_msg_id}`."
+                f"Skip (`{skip}`) must be less than last message id (`{last_msg_id}`)."
             )
 
-        set_state(client, "forward_state", user_id, None)
+        action = forward_state["action"]
+        target_chat_id = forward_state.get("target_chat_id")
+        from core.op_filters import default_op_filters, normalize_op_filters
+        from handlers.source_handler import QF_FILTERS
+        if user_id not in QF_FILTERS:
+            QF_FILTERS[user_id] = default_op_filters()
+        filt = normalize_op_filters(QF_FILTERS.get(user_id))
 
-        from handlers.source_handler import FORWARDING, CANCEL_FLAGS
-        from core.forwarder import forward_messages
+        # Store ready state — do NOT start until user taps Start
+        set_state(client, "forward_state", user_id, {
+            "action": "ready",
+            "mode": "single" if action == "waiting_skip" else "all",
+            "source_chat_id": source_chat_id,
+            "last_msg_id": last_msg_id,
+            "skip": skip,
+            "target_chat_id": target_chat_id,
+        })
 
-        if forward_state["action"] == "waiting_skip":
-            target = await get_target(user_id, forward_state["target_chat_id"])
-            if not target:
-                return await message.reply("Target not found.")
-
-            msg = await message.reply(
-                f"**Quick Forward starting**\n\n"
-                f"Target: {target.get('title')}\n"
-                f"Skip: `{skip}`  Last: `{last_msg_id}`\n\n"
-                f"Send `cancel` to stop."
-            )
-            FORWARDING[user_id] = True
-            CANCEL_FLAGS[user_id] = False
-            try:
-                await forward_messages(
-                    client=client,
-                    user_id=user_id,
-                    source_chat_id=source_chat_id,
-                    target=target,
-                    last_msg_id=last_msg_id,
-                    skip=skip,
-                    progress_message=msg,
-                    cancel_flag=CANCEL_FLAGS,
-                )
-            except Exception as e:
-                await msg.edit_text(friendly_error("quick forward (single target)", e))
-            finally:
-                FORWARDING[user_id] = False
-                CANCEL_FLAGS[user_id] = False
-            return
-
-        targets = await get_user_targets(user_id)
-        if not targets:
-            return await message.reply("No targets found.")
-
-        msg = await message.reply(
-            f"**Quick Forward to ALL targets** ({len(targets)})\nSkip: `{skip}`"
+        types = ", ".join(filt.get("media_types") or [])
+        text_out = (
+            "**Quick Forward — ready**" + chr(10) + chr(10)
+            + f"Skip: `{skip}` · Last: `{last_msg_id}`" + chr(10)
+            + f"Filters: `{types}`" + chr(10)
+            + f"Block: {'ON' if filt.get('block_enabled') else 'OFF'} · "
+            + f"White: {'ON' if filt.get('whitelist_enabled') else 'OFF'}" + chr(10) + chr(10)
+            + "Tap **Start** to begin. Forwarding does not start automatically."
         )
-        FORWARDING[user_id] = True
-        CANCEL_FLAGS[user_id] = False
-        try:
-            for idx, target in enumerate(targets, 1):
-                if CANCEL_FLAGS.get(user_id):
-                    await msg.edit_text("Cancelled.")
-                    break
-                await msg.edit_text(
-                    f"**Target {idx}/{len(targets)}:** {target.get('title')}"
-                )
-                await forward_messages(
-                    client=client,
-                    user_id=user_id,
-                    source_chat_id=source_chat_id,
-                    target=target,
-                    last_msg_id=last_msg_id,
-                    skip=skip,
-                    progress_message=msg,
-                    cancel_flag=CANCEL_FLAGS,
-                )
-            if not CANCEL_FLAGS.get(user_id):
-                await msg.edit_text(f"Done for {len(targets)} target(s).")
-        except Exception as e:
-            await msg.edit_text(friendly_error("quick forward (all targets)", e))
-        finally:
-            FORWARDING[user_id] = False
-            CANCEL_FLAGS[user_id] = False
+        from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶️ Start", callback_data="qf:start")],
+            [InlineKeyboardButton("🔍 Filters", callback_data="qf:filters")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="src:cancel")],
+        ])
+        await message.reply(text_out, reply_markup=kb)
         return
 
     account_state = get_state(client, "account_add_state", user_id)
@@ -447,92 +423,201 @@ async def handle_all_text_input(client: Client, message: Message):
                 await message.reply(friendly_error("account login: 2FA", e) + "\n\nOr /cancel.")
             return
 
+
+    # Jobs Log Channel set
+    jlog_st = get_state(client, "jobs_log_channel_state", user_id)
+    if jlog_st and (jlog_st.get("step") if isinstance(jlog_st, dict) else None) == "await_chat":
+        raw = (text or "").strip()
+        try:
+            from core.chat_resolve import parse_chat_ref
+            chat_id, username, display = parse_chat_ref(raw)
+            origin = getattr(message, "forward_origin", None)
+            origin_chat = None
+            if origin is not None:
+                origin_chat = getattr(origin, "chat", None) or getattr(
+                    origin, "sender_chat", None
+                )
+            title = None
+            uname = username
+            cid = chat_id
+            if origin_chat is not None:
+                cid = int(origin_chat.id)
+                title = getattr(origin_chat, "title", None) or str(cid)
+                uname = getattr(origin_chat, "username", None)
+            else:
+                # resolve via management bot (must post in log channel)
+                ref = username or chat_id
+                try:
+                    ch = await client.get_chat(ref)
+                    cid = int(ch.id)
+                    title = ch.title or str(cid)
+                    uname = getattr(ch, "username", None)
+                except Exception as e:
+                    set_state(client, "jobs_log_channel_state", user_id, None)
+                    return await message.reply(
+                        "Could not access that chat as the management bot (%s). "
+                        "Add the bot as admin with post permission, then try again."
+                        % type(e).__name__
+                    )
+            # permission probe: try empty edit or get_chat_member me
+            try:
+                mem = await client.get_chat_member(cid, "me")
+                status = str(getattr(mem, "status", "") or "").lower()
+                if "admin" not in status and "creator" not in status and "owner" not in status:
+                    # still allow if can post somehow
+                    pass
+            except Exception:
+                pass
+            from database import set_jobs_log_channel
+            await set_jobs_log_channel(user_id, int(cid), title=title, username=uname)
+            set_state(client, "jobs_log_channel_state", user_id, None)
+            return await message.reply(
+                "Jobs Log Channel set to **%s** (`%s`).\n"
+                "Open a job and tap **Send Log Message** to post progress there."
+                % (title or cid, cid)
+            )
+        except Exception as e:
+            set_state(client, "jobs_log_channel_state", user_id, None)
+            return await message.reply("Failed: %s" % type(e).__name__)
+
+
+
+
+    qfs = get_state(client, "qf_filter_state", user_id)
+    if qfs and isinstance(qfs, dict):
+        word = (text or "").strip()
+        if not word:
+            return await message.reply("Send a non-empty word.")
+        from handlers.source_handler import QF_FILTERS
+        from core.op_filters import normalize_op_filters, default_op_filters
+        f = normalize_op_filters(QF_FILTERS.get(user_id) or default_op_filters())
+        key = "block_words" if qfs.get("kind") == "block" else "whitelist_words"
+        words = list(f.get(key) or [])
+        if word not in words:
+            words.append(word)
+        f[key] = words
+        QF_FILTERS[user_id] = f
+        set_state(client, "qf_filter_state", user_id, None)
+        return await message.reply(
+            f"Added `{word}` to Quick Forward {key}. "
+            "Open Filters again to review (Jobs filters are separate)."
+        )
+
+    jfs = get_state(client, "job_filter_state", user_id)
+    if jfs and isinstance(jfs, dict) and jfs.get("job_id"):
+        word = (text or "").strip()
+        if not word:
+            return await message.reply("Send a non-empty word.")
+        from database import get_job, update_job
+        from core.op_filters import normalize_op_filters
+        job = await get_job(user_id, jfs["job_id"])
+        if not job:
+            set_state(client, "job_filter_state", user_id, None)
+            return await message.reply("Job not found.")
+        f = normalize_op_filters(job.get("filters"))
+        key = "block_words" if jfs.get("kind") == "block" else "whitelist_words"
+        words = list(f.get(key) or [])
+        if word not in words:
+            words.append(word)
+        f[key] = words
+        await update_job(user_id, jfs["job_id"], {"filters": f})
+        set_state(client, "job_filter_state", user_id, None)
+        return await message.reply(f"Added `{word}` to {key}. Open Job → Filters to review.")
+
     add_state = get_state(client, "target_add_state", user_id)
     if add_state:
+        step = add_state.get("step") if isinstance(add_state, dict) else None
+        if step not in (None, "await_chat"):
+            return
+
+        raw = (text or "").strip()
         try:
-            chat = None
-            raw = text.strip()
-            try:
-                if raw.startswith("@"):
-                    chat = await client.get_chat(raw)
-                elif raw.startswith("https://t.me/") or raw.startswith("t.me/"):
-                    chat = await client.get_chat(raw)
-                else:
-                    chat_id = int(raw)
-                    try:
-                        chat = await client.get_chat(chat_id)
-                    except Exception:
-                        # common: user pasted public channel id without -100 prefix
-                        if chat_id > 0:
-                            try:
-                                chat = await client.get_chat(int(f"-100{chat_id}"))
-                            except Exception:
-                                raise
-                        else:
-                            raise
-            except Exception as e:
-                return await message.reply(
-                    "❌ Could not resolve that chat from this message.\n\n"
-                    "• Prefer **@username** or invite link\n"
-                    "• Raw IDs only work if a client already knows the peer\n"
-                    "• Management Bot does **not** need to be admin\n"
-                    f"• Error: `{type(e).__name__}`"
+            from core.chat_resolve import parse_chat_ref
+
+            chat_id, username, display = parse_chat_ref(raw)
+            origin = getattr(message, "forward_origin", None)
+            origin_chat = None
+            if origin is not None:
+                origin_chat = getattr(origin, "chat", None) or getattr(
+                    origin, "sender_chat", None
                 )
 
-            if chat.type not in [ChatType.CHANNEL, ChatType.SUPERGROUP, ChatType.GROUP]:
-                return await message.reply("❌ Only Channels and Groups are supported.")
+            title = None
+            if origin_chat is not None:
+                chat_id = int(origin_chat.id)
+                title = getattr(origin_chat, "title", None) or ("Chat %s" % chat_id)
+                username = getattr(origin_chat, "username", None)
+            else:
+                if chat_id is None and not username:
+                    return await message.reply(
+                        "Send a chat id like `-1001569283029`, or @username, "
+                        "or forward a message from that chat."
+                    )
+                title = ("@" + username.lstrip("@")) if username else (
+                    "Chat %s" % chat_id if chat_id is not None else display
+                )
 
             from core.access import check_limit
-            err = await check_limit(user_id, "targets", len(await get_user_targets(user_id)))
+            from database import get_user_targets, get_user_bots, get_user_accounts
+
+            err = await check_limit(
+                user_id, "targets", len(await get_user_targets(user_id))
+            )
             if err:
                 set_state(client, "target_add_state", user_id, None)
                 return await message.reply(err)
 
+            from handlers.ui import active_accounts_only
+            from handlers.target_handlers import (
+                _executor_pick_keyboard,
+                _active_bots_only,
+            )
+
             bots = await get_user_bots(user_id)
             accs = await get_user_accounts(user_id)
-            if not bots and not accs:
+            bots_a = _active_bots_only(bots)
+            accs_a = active_accounts_only(accs)
+            if not bots_a and not accs_a:
                 set_state(client, "target_add_state", user_id, None)
                 return await message.reply(
-                    "❌ Add at least one Bot or User Account before adding a Target Chat."
+                    "No active Bot or User Account found. "
+                    "Disabled accounts are not listed. Enable one first."
                 )
 
-            # Management Bot is NOT required as admin — verify via selected bot/account
-            set_state(client, "target_add_state", user_id, {
-                "step": "pick_executor",
-                "chat_id": chat.id,
-                "title": chat.title or "Unknown",
-                "username": getattr(chat, "username", None),
-            })
-            from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-            rows = []
-            for b in bots[:15]:
-                name = b.get("bot_username") or b.get("name") or b.get("bot_id") or "?"
-                bid = str(b.get("bot_id") or "")
-                rows.append([InlineKeyboardButton(
-                    f"🤖 {name}", callback_data=f"tg:exec:bot:{bid}"
-                )])
-            for a in accs[:15]:
-                name = a.get("name") or a.get("phone") or a.get("account_id") or "?"
-                aid = str(a.get("account_id") or "")
-                rows.append([InlineKeyboardButton(
-                    f"👤 {name}", callback_data=f"tg:exec:acc:{aid}"
-                )])
-            rows.append([InlineKeyboardButton("« Cancel", callback_data="tg:list")])
-            await message.reply(
-                f"**Select execution identity to verify**\n\n"
-                f"Chat: **{chat.title}** (`{chat.id}`)\n\n"
-                f"Management Bot does **not** need to be admin.\n"
-                f"Pick the Bot or Account that is admin in this chat.",
-                reply_markup=InlineKeyboardMarkup(rows),
+            set_state(
+                client,
+                "target_add_state",
+                user_id,
+                {
+                    "step": "pick_executor",
+                    "chat_id": int(chat_id) if chat_id else None,
+                    "username": username,
+                    "title": title or display,
+                    "selected_bots": [],
+                    "selected_accounts": [],
+                },
             )
-        except ValueError:
-            await message.reply("❌ Invalid Chat ID. Please send a valid number or @username.")
+            if chat_id:
+                label = "%s (`%s`)" % (title or "Chat", chat_id)
+            else:
+                label = str(username or display)
+            text_out = (
+                "**Select bot(s) / account(s) to verify**" + chr(10) + chr(10)
+                + "Chat: **" + label + "**" + chr(10) + chr(10)
+                + "• Toggle one or more (disabled accounts hidden)" + chr(10)
+                + "• Only selected bots/accounts resolve + check admin" + chr(10)
+                + "• Management Bot is not used" + chr(10) + chr(10)
+                + "Then tap **Done — check permissions**."
+            )
+            await message.reply(
+                text_out,
+                reply_markup=_executor_pick_keyboard(bots, accs, [], []),
+            )
         except Exception as e:
             await message.reply(
-                friendly_error("add target", e) + "\n\n"
-                "Tips:\n"
-                "• Prefer @username or invite link if the chat is private\n"
-                "• You will verify via your My Bot / My Account (Management Bot admin not required)"
+                friendly_error("add target", e)
+                + chr(10) + chr(10)
+                + "Send `-100...` / @username or forward a message."
             )
         return
 

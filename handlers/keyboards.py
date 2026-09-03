@@ -419,6 +419,9 @@ def jobs_list_keyboard(
         InlineKeyboardButton("🔄 Refresh", callback_data=f"job:list:{sf}"),
     ])
     buttons.append([
+        InlineKeyboardButton("📢 Jobs Log Channel", callback_data="jlog:cfg"),
+    ])
+    buttons.append([
         InlineKeyboardButton("« Back to Dashboard", callback_data="dash:home")
     ])
     return InlineKeyboardMarkup(buttons)
@@ -477,7 +480,7 @@ def select_targets_keyboard(targets: List[Dict], selected: List[int]) -> InlineK
         ])
 
     buttons.append([
-        InlineKeyboardButton("➡️ Next: Choose Method", callback_data="jobcreate:next_method")
+        InlineKeyboardButton("➡️ Next: Options", callback_data="jobcreate:next_confirm")
     ])
     buttons.append([
         InlineKeyboardButton("❌ Cancel", callback_data="job:list")
@@ -520,7 +523,7 @@ def select_accounts_keyboard(accounts: List[Dict], selected: List[str]) -> Inlin
         ])
 
     buttons.append([
-        InlineKeyboardButton("➡️ Continue", callback_data="jobcreate:next_options")
+        InlineKeyboardButton("➡️ Next: Select Targets", callback_data="jobcreate:next_targets")
     ])
     buttons.append([
         InlineKeyboardButton("❌ Cancel", callback_data="job:list")

@@ -105,7 +105,7 @@ async def show_wroxen_home(client: Client, query: CallbackQuery) -> None:
     await safe_edit(query, await _home_text(user_id), _wx_home_kb(has_db))
 
 
-@Client.on_callback_query(filters.regex(r"^wx:"))
+@Client.on_callback_query(filters.regex(r"^wx:") & ~filters.regex(r"^wx:idx_"))
 async def wroxen_callbacks(client: Client, query: CallbackQuery):
     user_id = query.from_user.id
     from core.access import can_access_bot, can_use_feature
@@ -348,8 +348,11 @@ async def wroxen_callbacks(client: Client, query: CallbackQuery):
             {
                 "step": "await_reindex_last",
                 "wroxen_id": wid,
-                "source_chat_id": cfg["source_chat_id"],
-                "bot_id": cfg["bot_id"],
+                "source_chat_id": cfg.get("source_chat_id"),
+                "source_title": cfg.get("source_title"),
+                "target_chat_id": cfg.get("target_chat_id"),
+                "target_title": cfg.get("target_title"),
+                "bot_id": cfg.get("bot_id"),
             },
         )
         await safe_edit(
@@ -390,14 +393,28 @@ async def _start_index_job(client: Client, query: CallbackQuery, user_id: int, s
     # Live Telegram permission checks (Management Bot admin NOT required)
     try:
         from core.permissions import verify_wroxen
-        sid = int(st["source_chat_id"])
-        tid = int(st["target_chat_id"])
+        sid = int(st.get("source_chat_id") or 0)
+        tid = int(st.get("target_chat_id") or 0)
+        if not sid or not tid:
+            return await query.answer(
+                "Missing source/target chat in session. Open Wroxen config and try Re-index again.",
+                show_alert=True,
+            )
         perm_err = await verify_wroxen(user_id, str(bot_id), sid, tid)
         if perm_err:
-            return await query.answer(perm_err, show_alert=True)
+            return await query.answer(perm_err[:180], show_alert=True)
+    except KeyError as e:
+        logger.exception("wroxen perm KeyError")
+        return await query.answer(
+            f"Permission check failed: missing field {e}. Re-open config and try again.",
+            show_alert=True,
+        )
     except Exception as e:
         logger.exception("wroxen perm check")
-        return await query.answer(f"Permission check failed: {type(e).__name__}", show_alert=True)
+        return await query.answer(
+            f"Permission check failed: {type(e).__name__}",
+            show_alert=True,
+        )
 
     # create config if new
     wid = st.get("wroxen_id")
@@ -442,34 +459,90 @@ async def _start_index_job(client: Client, query: CallbackQuery, user_id: int, s
     )
 
 
+
 @Client.on_callback_query(filters.regex(r"^wx:idx_"))
 async def wroxen_index_progress(client: Client, query: CallbackQuery):
+    """Refresh / Stop for Wroxen indexing progress message."""
     user_id = query.from_user.id
     from core.access import can_access_bot
     if not await can_access_bot(user_id):
-        return
-    if query.data == "wx:idx_stop":
-        request_cancel(user_id)
-        text = format_live(user_id) or "🛑 Stop requested…"
-        kb = InlineKeyboardMarkup([
+        try:
+            return await query.answer("Not allowed", show_alert=True)
+        except Exception:
+            return
+
+    data = query.data or ""
+    from core.wroxen.indexer import (
+        request_cancel,
+        format_live,
+        get_progress,
+        is_running,
+    )
+    from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    def _kb(status: str):
+        if status in ("done", "cancelled", "error"):
+            return InlineKeyboardMarkup([
+                [InlineKeyboardButton("« Wroxen", callback_data="wx:home")],
+            ])
+        return InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Refresh", callback_data="wx:idx_prog")],
             [InlineKeyboardButton("❌ Stop", callback_data="wx:idx_stop")],
         ])
+
+    p = get_progress(user_id)
+    status = (p or {}).get("status") or "idle"
+
+    if data == "wx:idx_stop":
+        request_cancel(user_id)
+        if p is not None:
+            p["status"] = "cancelled"
+        text = format_live(user_id) or "🛑 Stop requested — indexing will stop shortly."
         try:
-            await safe_edit(query, text, kb)
+            await query.message.edit_text(text, reply_markup=_kb("cancelled"))
+        except Exception:
+            try:
+                await safe_edit(query, text, _kb("cancelled"))
+            except Exception:
+                pass
+        try:
+            await query.answer("Stop requested")
         except Exception:
             pass
-        return await query.answer("Stop requested")
-    if query.data == "wx:idx_prog":
-        text = format_live(user_id)
-        if not text:
-            return await query.answer("No active index (finished or not started)", show_alert=True)
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Refresh", callback_data="wx:idx_prog")],
-            [InlineKeyboardButton("❌ Stop", callback_data="wx:idx_stop")],
-        ])
-        await safe_edit(query, text, kb)
-        return await safe_answer(query)
+        return
+
+    if data == "wx:idx_prog":
+        if not p:
+            try:
+                await query.answer(
+                    "No active index (finished or not started)",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+            return
+        text = format_live(user_id) or "No progress data."
+        st = p.get("status") or "running"
+        try:
+            await query.message.edit_text(text, reply_markup=_kb(st))
+        except Exception as e:
+            # MessageNotModified = same text; still ack
+            if "MESSAGE_NOT_MODIFIED" not in str(e).upper() and type(e).__name__ != "MessageNotModified":
+                try:
+                    await safe_edit(query, text, _kb(st))
+                except Exception:
+                    pass
+        try:
+            await query.answer("Refreshed" if st == "running" else st.title())
+        except Exception:
+            pass
+        return
+
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
 
 
 async def handle_wroxen_text(client: Client, message: Message) -> bool:

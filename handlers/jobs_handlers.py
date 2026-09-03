@@ -67,6 +67,71 @@ from handlers.ui import (
 logger = logging.getLogger(__name__)
 
 
+
+def _job_filters_text(job: dict) -> str:
+    from core.op_filters import normalize_op_filters, ALL_MEDIA_TYPES
+    f = normalize_op_filters(job.get("filters"))
+    types = f.get("media_types") or []
+    lines = [
+        "**Job Filters** (independent of target settings)",
+        "",
+        "**Message types:**",
+    ]
+    for mt in ALL_MEDIA_TYPES:
+        mark = "ON" if mt in types else "off"
+        lines.append(f"- `{mt}`: {mark}")
+    lines.append("")
+    lines.append(
+        "Block list: **%s** · `%s` words"
+        % ("ON" if f.get("block_enabled") else "OFF", len(f.get("block_words") or []))
+    )
+    lines.append(
+        "Whitelist: **%s** · `%s` words"
+        % ("ON" if f.get("whitelist_enabled") else "OFF", len(f.get("whitelist_words") or []))
+    )
+    return chr(10).join(lines)
+
+
+def _job_filters_kb(job: dict):
+    from core.op_filters import normalize_op_filters, ALL_MEDIA_TYPES
+    from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    job_id = job["job_id"]
+    f = normalize_op_filters(job.get("filters"))
+    types = set(f.get("media_types") or [])
+    rows = []
+    row = []
+    for mt in ALL_MEDIA_TYPES:
+        mark = "✅" if mt in types else "⬜"
+        row.append(InlineKeyboardButton(
+            f"{mark} {mt}", callback_data=f"job:ft:{job_id}:mt:{mt}"
+        ))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    be = "ON" if f.get("block_enabled") else "OFF"
+    we = "ON" if f.get("whitelist_enabled") else "OFF"
+    rows.append([
+        InlineKeyboardButton(f"Block {be}", callback_data=f"job:ft:{job_id}:btog"),
+        InlineKeyboardButton(f"White {we}", callback_data=f"job:ft:{job_id}:wtog"),
+    ])
+    rows.append([
+        InlineKeyboardButton("+ Block word", callback_data=f"job:ft:{job_id}:badd"),
+        InlineKeyboardButton("Block list", callback_data=f"job:ft:{job_id}:bview"),
+    ])
+    rows.append([
+        InlineKeyboardButton("+ White word", callback_data=f"job:ft:{job_id}:wadd"),
+        InlineKeyboardButton("White list", callback_data=f"job:ft:{job_id}:wview"),
+    ])
+    rows.append([
+        InlineKeyboardButton("Clear block", callback_data=f"job:ft:{job_id}:bclr"),
+        InlineKeyboardButton("Clear white", callback_data=f"job:ft:{job_id}:wclr"),
+    ])
+    rows.append([InlineKeyboardButton("« Job", callback_data=f"job:open:{job_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
 def job_controls_keyboard(job: dict) -> InlineKeyboardMarkup:
     job_id = job["job_id"]
     status = job.get("status", "pending")
@@ -155,6 +220,7 @@ def job_controls_keyboard(job: dict) -> InlineKeyboardMarkup:
     buttons.append(
         [
             InlineKeyboardButton("📋 Logs", callback_data=f"job:logs:{job_id}"),
+            InlineKeyboardButton("🔍 Filters", callback_data=f"job:filters:{job_id}"),
         ]
     )
     if status == "running":
@@ -169,6 +235,12 @@ def job_controls_keyboard(job: dict) -> InlineKeyboardMarkup:
     buttons.append(
         [
             InlineKeyboardButton("🔄 Refresh", callback_data=f"job:open:{job_id}"),
+        ]
+    )
+    buttons.append(
+        [
+            InlineKeyboardButton("📤 Send Log Message", callback_data=f"jlog:send:{job_id}"),
+            InlineKeyboardButton("📢 Log Channel", callback_data="jlog:cfg"),
         ]
     )
     buttons.append(
@@ -935,28 +1007,33 @@ async def jobs_callbacks(client: Client, query: CallbackQuery):
         job = await get_job_scoped(user_id, job_id)
         if not job:
             return await safe_answer(query, "Job not found", True)
-        # Bind this message for periodic progress auto-update while running
-        if (job.get("status") or "").lower() == "running":
-            try:
-                msg = query.message
-                await update_job(user_id, job_id, {
-                    "progress_chat_id": msg.chat.id,
-                    "progress_message_id": msg.id,
-                    "progress_ui_bound_at": __import__("datetime").datetime.now(
-                        __import__("datetime").timezone.utc
-                    ),
-                })
-                job = await get_job_scoped(user_id, job_id) or job
-            except Exception:
-                pass
+        # Render only - never bind / enable auto-update here
         text = job_detail_text(job)
         if (job.get("status") or "").lower() == "running":
             from handlers.ui import fmt_interval
-            text += (
-                f"\n\n⏱ **Progress auto-update:** "
-                f"`{fmt_interval(job_progress_ui_interval(job))}` "
-                f"(while this screen is bound · 5m–1d)"
-            )
+            enabled = bool(job.get("progress_ui_enabled"))
+            bound_here = False
+            try:
+                if (
+                    enabled
+                    and job.get("progress_message_id")
+                    and int(job.get("progress_message_id")) == int(query.message.id)
+                ):
+                    bound_here = True
+            except Exception:
+                pass
+            if enabled and bound_here:
+                text += (
+                    chr(10) + chr(10) + "Progress auto-update: ON - "
+                    + fmt_interval(job_progress_ui_interval(job))
+                    + " (this message)"
+                )
+            else:
+                text += (
+                    chr(10) + chr(10)
+                    + "Progress auto-update: OFF "
+                    + "(use Progress auto-update button to enable on this message)"
+                )
         await safe_edit(query, text, job_controls_keyboard(job))
         return await safe_answer(query)
 
@@ -1139,6 +1216,7 @@ async def jobs_callbacks(client: Client, query: CallbackQuery):
             return await safe_answer(query, "Invalid interval", True)
         await update_job(user_id, job_id, {"monitor_interval_seconds": seconds})
         job = await get_job_scoped(user_id, job_id)
+        from handlers.ui import fmt_interval
         await safe_answer(query, f"Interval → {fmt_interval(seconds)}", True)
         await safe_edit(query, job_monitor_text(job), job_monitor_keyboard(job))
         return
@@ -1148,6 +1226,7 @@ async def jobs_callbacks(client: Client, query: CallbackQuery):
         job = await get_job_scoped(user_id, job_id)
         if not job:
             return await safe_answer(query, "Job not found", True)
+        from handlers.ui import fmt_interval
         cur = job_monitor_interval(job)
         await safe_edit(
             query,
@@ -1160,6 +1239,24 @@ async def jobs_callbacks(client: Client, query: CallbackQuery):
 
     if data.startswith("job:pui:"):
         parts = data.split(":")
+        if len(parts) >= 4 and parts[2] == "off":
+            job_id = parts[3]
+            await update_job(
+                user_id,
+                job_id,
+                {
+                    "progress_ui_enabled": False,
+                    "progress_chat_id": None,
+                    "progress_message_id": None,
+                    "progress_ui_bound_at": None,
+                    "progress_ui_last_at": None,
+                },
+            )
+            await safe_answer(query, "Progress auto-update OFF", True)
+            job = await get_job_scoped(user_id, job_id)
+            if job:
+                await safe_edit(query, job_detail_text(job), job_controls_keyboard(job))
+            return
         # job:pui:set:<job_id>:<seconds>
         if len(parts) >= 5 and parts[2] == "set":
             job_id = parts[3]
@@ -1180,7 +1277,21 @@ async def jobs_callbacks(client: Client, query: CallbackQuery):
                 seconds = clamp_progress_ui_interval(raw_sec, allow_fast=_priv)
             except Exception:
                 return await safe_answer(query, "Invalid", True)
-            await update_job(user_id, job_id, {"progress_ui_interval_seconds": seconds})
+            from datetime import datetime, timezone
+            msg = query.message
+            await update_job(
+                user_id,
+                job_id,
+                {
+                    "progress_ui_interval_seconds": seconds,
+                    "progress_ui_enabled": True,
+                    "progress_chat_id": msg.chat.id,
+                    "progress_message_id": msg.id,
+                    "progress_ui_bound_at": datetime.now(timezone.utc),
+                    "progress_ui_last_at": None,
+                },
+            )
+
             from handlers.ui import fmt_interval
             await safe_answer(query, f"Progress update → {fmt_interval(seconds)}", True)
             job = await get_job_scoped(user_id, job_id)
@@ -1192,7 +1303,11 @@ async def jobs_callbacks(client: Client, query: CallbackQuery):
         # job:pui:custom:<job_id>
         if len(parts) >= 4 and parts[2] == "custom":
             job_id = parts[3]
-            set_state(client, "job_progress_ui_state", user_id, {"job_id": job_id})
+            set_state(client, "job_progress_ui_state", user_id, {
+                "job_id": job_id,
+                "chat_id": query.message.chat.id,
+                "message_id": query.message.id,
+            })
             await safe_edit(
                 query,
                 "**⏱ Custom progress auto-update**\n\n"
@@ -1242,18 +1357,82 @@ async def jobs_callbacks(client: Client, query: CallbackQuery):
             "✏️ Custom (minutes)",
             callback_data=f"job:pui:custom:{job_id}",
         )])
+        enabled = bool(job.get("progress_ui_enabled"))
+        rows.append([InlineKeyboardButton(
+            "❌ Disable auto-update" if enabled else "Auto-update is OFF",
+            callback_data=f"job:pui:off:{job_id}",
+        )])
         rows.append([InlineKeyboardButton("« Back", callback_data=f"job:open:{job_id}")])
         await safe_edit(
             query,
             f"**⏱ Progress auto-update**\n\n"
             f"Job: **{job.get('name') or job_id}**\n"
-            f"Current: **{fmt_interval(cur)}**\n\n"
-            "While the job is **running** and you opened its progress screen, "
-            "the bot edits that message on this interval.\n\n"
-            "Min **30 min** (owner/admin: **5/10 min**) · Max **1 day** · Default **30 min**.\n"
-            "Works only while this job progress screen stays open in the management bot.",
+            f"Status: **{'ON' if enabled else 'OFF'}** · Interval: **{fmt_interval(cur)}**\n\n"
+            "Default OFF. Choosing an interval enables auto-update on THIS message only.\n"
+            "Opening a job does not enable auto-update. Manual Refresh does not bind.",
             InlineKeyboardMarkup(rows),
         )
+        return await safe_answer(query)
+
+
+    if data.startswith("job:filters:"):
+        job_id = data.split(":")[2]
+        job = await get_job_scoped(user_id, job_id)
+        if not job:
+            return await safe_answer(query, "Job not found", True)
+        from core.op_filters import normalize_op_filters
+        if not job.get("filters"):
+            await update_job(user_id, job_id, {"filters": normalize_op_filters(None)})
+            job = await get_job_scoped(user_id, job_id) or job
+        await safe_edit(query, _job_filters_text(job), _job_filters_kb(job))
+        return await safe_answer(query)
+
+    if data.startswith("job:ft:"):
+        parts = data.split(":")
+        job_id = parts[2]
+        action = parts[3] if len(parts) > 3 else ""
+        job = await get_job_scoped(user_id, job_id)
+        if not job:
+            return await safe_answer(query, "Job not found", True)
+        from core.op_filters import normalize_op_filters
+        f = normalize_op_filters(job.get("filters"))
+        if action == "mt":
+            mt = parts[4] if len(parts) > 4 else ""
+            types = list(f.get("media_types") or [])
+            if mt in types:
+                types.remove(mt)
+            else:
+                types.append(mt)
+            if not types:
+                types = ["video", "document"]
+            f["media_types"] = types
+        elif action == "btog":
+            f["block_enabled"] = not bool(f.get("block_enabled"))
+        elif action == "wtog":
+            f["whitelist_enabled"] = not bool(f.get("whitelist_enabled"))
+        elif action == "bclr":
+            f["block_words"] = []
+        elif action == "wclr":
+            f["whitelist_words"] = []
+        elif action == "bview":
+            words = f.get("block_words") or []
+            msg = ", ".join(words) if words else "Block list empty"
+            await safe_answer(query, msg[:180], True)
+            return
+        elif action == "wview":
+            words = f.get("whitelist_words") or []
+            await safe_answer(query, (", ".join(words)[:180] if words else "Whitelist empty"), True)
+            return
+        elif action in ("badd", "wadd"):
+            set_state(client, "job_filter_state", user_id, {
+                "job_id": job_id,
+                "kind": "block" if action == "badd" else "white",
+            })
+            await safe_edit(query, "Send the word/phrase to add. /cancel to abort.")
+            return await safe_answer(query)
+        await update_job(user_id, job_id, {"filters": f})
+        job = await get_job_scoped(user_id, job_id) or job
+        await safe_edit(query, _job_filters_text(job), _job_filters_kb(job))
         return await safe_answer(query)
 
     if data.startswith("job:logs:"):
@@ -1428,6 +1607,12 @@ async def jobs_callbacks(client: Client, query: CallbackQuery):
             pass
         job = await get_job_scoped(user_id, job_id)
         await safe_edit(query, job_detail_text(job), job_controls_keyboard(job))
+        try:
+            from core.jobs_log import edit_log_message
+            if job and job.get("log_progress_message_id"):
+                await edit_log_message(client, job)
+        except Exception:
+            pass
         return
 
     if data.startswith("job:pause:"):
@@ -1441,6 +1626,12 @@ async def jobs_callbacks(client: Client, query: CallbackQuery):
         await safe_answer(query, "Paused — will not auto-resume", True)
         job = await get_job_scoped(user_id, job_id)
         await safe_edit(query, job_detail_text(job), job_controls_keyboard(job))
+        try:
+            from core.jobs_log import edit_log_message
+            if job and job.get("log_progress_message_id"):
+                await edit_log_message(client, job)
+        except Exception:
+            pass
         return
         
 
@@ -1464,6 +1655,12 @@ async def jobs_callbacks(client: Client, query: CallbackQuery):
         await safe_answer(query, "Job cancelled")
         job = await get_job_scoped(user_id, job_id)
         await safe_edit(query, job_detail_text(job), job_controls_keyboard(job))
+        try:
+            from core.jobs_log import edit_log_message
+            if job and job.get("log_progress_message_id"):
+                await edit_log_message(client, job)
+        except Exception:
+            pass
         return
 
     if data.startswith("job:delete:"):
@@ -1541,6 +1738,65 @@ async def job_create_callbacks(client: Client, query: CallbackQuery):
         )
         return await safe_answer(query)
 
+
+    if action == "next_targets":
+        if (state.get("method") or "") == "user" and not state.get("selected_accounts"):
+            return await safe_answer(query, "Select at least one account.", True)
+        if (state.get("method") or "") == "bot" and not state.get("bot_id"):
+            return await safe_answer(query, "Select a forward bot.", True)
+        from core.permissions import validate_job_create_permissions
+        ok_p, msg_p = await validate_job_create_permissions(
+            user_id=user_id,
+            method=state.get("method") or "user",
+            source_chat_id=state.get("source_chat_id"),
+            target_chat_ids=[],
+            account_ids=state.get("selected_accounts") or [],
+            bot_id=state.get("bot_id"),
+            mgmt_client=client,
+            check_targets=False,
+            check_source=True,
+        )
+        if not ok_p:
+            return await safe_answer(query, msg_p[:180], True)
+        targets = await get_user_targets(user_id)
+        if not targets:
+            return await safe_answer(
+                query, "No targets yet. Add one first (Targets → Add Target).", True
+            )
+        state["step"] = "select_targets"
+        state["selected_targets"] = []
+        _persist_create(client, user_id, state)
+        await safe_edit(
+            query,
+            "**Source access OK** for your selected executor(s).\n\n"
+            "**Create Job – Select Targets**\n"
+            "Permission on targets will use only the same selected bot/accounts.",
+            select_targets_keyboard(targets, []),
+        )
+        return await safe_answer(query)
+
+    if action == "next_confirm":
+        if not state.get("selected_targets"):
+            return await safe_answer(query, "Select at least one target first.", True)
+        from core.permissions import validate_job_create_permissions
+        ok_p, msg_p = await validate_job_create_permissions(
+            user_id=user_id,
+            method=state.get("method") or "user",
+            source_chat_id=state.get("source_chat_id"),
+            target_chat_ids=state.get("selected_targets") or [],
+            account_ids=state.get("selected_accounts") or [],
+            bot_id=state.get("bot_id"),
+            mgmt_client=client,
+            check_targets=True,
+            check_source=False,
+        )
+        if not ok_p:
+            return await safe_answer(query, msg_p[:180], True)
+        show_confirm(state)
+        _persist_create(client, user_id, state)
+        await safe_edit(query, job_confirm_text(state), job_confirm_keyboard(state))
+        return await safe_answer(query)
+
     if action == "method":
         method = parts[2]
         state["method"] = method
@@ -1592,19 +1848,17 @@ async def job_create_callbacks(client: Client, query: CallbackQuery):
         return await safe_answer(query)
 
     if action == "next_options":
-        if not state.get("selected_accounts"):
-            return await safe_answer(query, "Select at least one account.", True)
-        show_confirm(state)
-        _persist_create(client, user_id, state)
-        await safe_edit(query, job_confirm_text(state), job_confirm_keyboard(state))
-        return await safe_answer(query)
+        query.data = "jobcreate:next_targets"
+        return await job_create_callbacks(client, query)
 
     if action == "select_bot":
         state["bot_id"] = parts[2]
-        show_confirm(state)
+        state["method"] = "bot"
         _persist_create(client, user_id, state)
-        await safe_edit(query, job_confirm_text(state), job_confirm_keyboard(state))
-        return await safe_answer(query)
+        query.data = "jobcreate:next_targets"
+        return await job_create_callbacks(client, query)
+
+
 
     if action == "noop":
         return await safe_answer(query, "This is the source last message ID, not skip.")
@@ -1657,6 +1911,21 @@ async def job_create_callbacks(client: Client, query: CallbackQuery):
             if _err:
                 return await safe_answer(query, _err, True)
 
+            from core.permissions import validate_job_create_permissions
+            ok_p, msg_p = await validate_job_create_permissions(
+                user_id=user_id,
+                method=state.get("method") or "user",
+                source_chat_id=state.get("source_chat_id"),
+                target_chat_ids=state.get("selected_targets") or [],
+                account_ids=state.get("selected_accounts") or [],
+                bot_id=state.get("bot_id"),
+                mgmt_client=client,
+                check_targets=True,
+                check_source=True,
+            )
+            if not ok_p:
+                return await safe_answer(query, msg_p[:180], True)
+
             job = await create_job(
                 user_id=user_id,
                 source_chat_id=state.get("source_chat_id"),
@@ -1691,3 +1960,236 @@ async def job_create_callbacks(client: Client, query: CallbackQuery):
         return await safe_answer(query, "Job created")
 
 
+
+
+# ═══════════════════════════════════════════════════════════
+# JOBS LOG CHANNEL
+# ═══════════════════════════════════════════════════════════
+
+@Client.on_callback_query(filters.regex(r"^jlog:"))
+async def jobs_log_callbacks(client: Client, query: CallbackQuery):
+    user_id = query.from_user.id
+    from core.access import can_access_bot
+    if not await can_access_bot(user_id):
+        return await safe_answer(query, "Not allowed", True)
+
+    data = query.data or ""
+    parts = data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    # ── Config UI ──
+    if action == "cfg":
+        from database import get_jobs_log_channel
+        cfg = await get_jobs_log_channel(user_id)
+        cid = cfg.get("chat_id")
+        if cid:
+            title = cfg.get("title") or str(cid)
+            uname = cfg.get("username")
+            uname_s = f"@{uname}" if uname else "—"
+            text = (
+                "**📢 Jobs Log Channel**\n\n"
+                f"**Current:** {title}\n"
+                f"**ID:** `{cid}`\n"
+                f"**Username:** {uname_s}\n\n"
+                "Progress messages are sent only when you tap "
+                "**Send Log Message** on a job."
+            )
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Change Channel", callback_data="jlog:set")],
+                [InlineKeyboardButton("❌ Remove Channel", callback_data="jlog:rm")],
+                [InlineKeyboardButton("« Jobs", callback_data="job:list")],
+            ])
+        else:
+            text = (
+                "**📢 Jobs Log Channel**\n\n"
+                "Not configured.\n\n"
+                "Set a channel where job progress cards will be posted "
+                "(only after **Send Log Message**)."
+            )
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Set Channel", callback_data="jlog:set")],
+                [InlineKeyboardButton("« Jobs", callback_data="job:list")],
+            ])
+        await safe_edit(query, text, kb)
+        return await safe_answer(query)
+
+    if action == "set":
+        set_state(client, "jobs_log_channel_state", user_id, {"step": "await_chat"})
+        await safe_edit(
+            query,
+            "**➕ Set Jobs Log Channel**\n\n"
+            "Send the channel **ID** or **@username**, or forward a message from it.\n\n"
+            "The **management bot** must be able to **post messages** there "
+            "(add the bot as admin with post permission).\n\n"
+            "/cancel to abort.",
+        )
+        return await safe_answer(query)
+
+    if action == "rm":
+        from database import set_jobs_log_channel
+        await set_jobs_log_channel(user_id, None)
+        await safe_answer(query, "Jobs Log Channel removed", True)
+        query.data = "jlog:cfg"
+        return await jobs_log_callbacks(client, query)
+
+    if action == "noop":
+        return await safe_answer(query)
+
+    # ── Job-scoped actions ──
+    job_id = parts[2] if len(parts) > 2 else None
+    if not job_id:
+        return await safe_answer(query, "Invalid", True)
+
+    job = await get_job(user_id, job_id)
+    if not job:
+        # owner/admin scope
+        try:
+            from database import get_job_scoped
+            job = await get_job_scoped(user_id, job_id)
+        except Exception:
+            job = None
+    if not job:
+        return await safe_answer(query, "Job not found", True)
+    owner_id = int(job.get("user_id") or user_id)
+
+    if action == "send":
+        from database import get_jobs_log_channel
+        cfg = await get_jobs_log_channel(owner_id)
+        if not cfg.get("chat_id"):
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📢 Set Jobs Log Channel", callback_data="jlog:cfg")],
+                [InlineKeyboardButton("« Job", callback_data=f"job:open:{job_id}")],
+            ])
+            await safe_edit(
+                query,
+                "⚠️ **Jobs Log Channel is not configured.**\n\n"
+                "Please configure a Jobs Log Channel first.",
+                kb,
+            )
+            return await safe_answer(query)
+        from core.jobs_log import send_or_reuse_log_message
+        msg, ok = await send_or_reuse_log_message(client, owner_id, job_id)
+        return await safe_answer(query, msg[:180], True)
+
+    # Control actions from log channel buttons — reuse existing job control
+    if action in ("pause", "start", "stop", "refresh"):
+        if action == "pause":
+            from core.job_worker import pause_running_job
+            await pause_running_job(owner_id, job_id, reason="user")
+            await safe_answer(query, "Paused")
+        elif action == "start":
+            start_fields = {
+                "status": JobStatus.RUNNING.value,
+                "pause_reason": None,
+                "error_message": None,
+            }
+            await update_job(owner_id, job_id, start_fields)
+            await safe_answer(query, "Started")
+        elif action == "stop":
+            try:
+                from core.job_worker import cancel_running_job
+                await cancel_running_job(owner_id, job_id)
+            except Exception:
+                await set_job_status(owner_id, job_id, JobStatus.CANCELLED.value)
+            await update_job(
+                owner_id,
+                job_id,
+                {
+                    "status": JobStatus.CANCELLED.value,
+                    "pre_index_status": "cancelled",
+                    "pause_reason": None,
+                    "log_progress_auto_update_enabled": False,
+                },
+            )
+            await safe_answer(query, "Stopped")
+        else:
+            await safe_answer(query, "Refreshed")
+
+        job = await get_job(owner_id, job_id) or job
+        from core.jobs_log import edit_log_message
+        await edit_log_message(client, job)
+        return
+
+    if action == "pui":
+        # Auto-update menu for LOG channel (independent of progress_ui)
+        job = await get_job(owner_id, job_id) or job
+        from database import job_log_progress_interval
+        from handlers.ui import fmt_interval
+        enabled = bool(job.get("log_progress_auto_update_enabled"))
+        cur = job_log_progress_interval(job)
+        text = (
+            "**⏱ Log Progress Auto Update**\n\n"
+            f"Current: **{'ON' if enabled else 'OFF'}** · `{fmt_interval(cur)}`\n\n"
+            "Independent from the normal Job Progress window timer."
+        )
+        from core.access import is_owner, is_admin as access_is_admin
+        priv = is_owner(user_id) or await access_is_admin(user_id)
+        rows = []
+        if priv:
+            rows.append([
+                InlineKeyboardButton("1m", callback_data=f"jlog:puiset:{job_id}:60"),
+                InlineKeyboardButton("2m", callback_data=f"jlog:puiset:{job_id}:120"),
+            ])
+        rows.append([
+            InlineKeyboardButton("5m", callback_data=f"jlog:puiset:{job_id}:300"),
+            InlineKeyboardButton("10m", callback_data=f"jlog:puiset:{job_id}:600"),
+        ])
+        rows.append([
+            InlineKeyboardButton("30m", callback_data=f"jlog:puiset:{job_id}:1800"),
+            InlineKeyboardButton("60m", callback_data=f"jlog:puiset:{job_id}:3600"),
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                "❌ Disable" if enabled else "✅ Keep OFF",
+                callback_data=f"jlog:puidis:{job_id}",
+            ),
+        ])
+        rows.append([
+            InlineKeyboardButton("« Back", callback_data=f"jlog:refresh:{job_id}"),
+        ])
+        # Edit on the log message itself if possible
+        try:
+            await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(rows))
+        except Exception:
+            await safe_edit(query, text, InlineKeyboardMarkup(rows))
+        return await safe_answer(query)
+
+    if action == "puiset":
+        job_id = parts[2]
+        seconds = int(parts[3])
+        from database import OWNER_ONLY_LOG_PROGRESS_UI, MIN_PROGRESS_UI_INTERVAL, MAX_PROGRESS_UI_INTERVAL
+        from core.access import is_owner, is_admin as access_is_admin
+        priv = is_owner(user_id) or await access_is_admin(user_id)
+        if seconds in OWNER_ONLY_LOG_PROGRESS_UI and not priv:
+            return await safe_answer(query, "1m/2m only for owner/admin", True)
+        if seconds not in OWNER_ONLY_LOG_PROGRESS_UI:
+            seconds = max(MIN_PROGRESS_UI_INTERVAL, min(MAX_PROGRESS_UI_INTERVAL, seconds))
+        await update_job(
+            owner_id,
+            job_id,
+            {
+                "log_progress_auto_update_enabled": True,
+                "log_progress_auto_update_interval": seconds,
+            },
+        )
+        await safe_answer(query, f"Log auto-update ON · {seconds}s", True)
+        job = await get_job(owner_id, job_id)
+        if job:
+            from core.jobs_log import edit_log_message
+            await edit_log_message(client, job)
+        return
+
+    if action == "puidis":
+        await update_job(
+            owner_id,
+            job_id,
+            {"log_progress_auto_update_enabled": False},
+        )
+        await safe_answer(query, "Log auto-update OFF", True)
+        job = await get_job(owner_id, job_id)
+        if job:
+            from core.jobs_log import edit_log_message
+            await edit_log_message(client, job)
+        return
+
+    return await safe_answer(query)
