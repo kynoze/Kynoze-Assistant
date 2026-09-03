@@ -508,3 +508,89 @@ async def validate_job_permissions(
         if not ok:
             return False, f"Target `{target_id}` → {msg}"
     return True, "All permissions OK"
+
+
+
+async def validate_job_create_permissions(
+    *,
+    user_id: int,
+    method: str,
+    source_chat_id,
+    target_chat_ids: list | None = None,
+    account_ids: list | None = None,
+    bot_id: str | None = None,
+    mgmt_client: Client | None = None,
+    check_targets: bool = True,
+    check_source: bool = True,
+) -> tuple[bool, str]:
+    """Check ONLY the selected bot / accounts — never a random executor.
+
+    method=user: each selected account member+ on source; admin on each target (if check_targets).
+    method=bot: selected bot access on source; admin on targets (if check_targets).
+    """
+    from core.job_worker import get_user_client, get_bot_client
+    from database import get_account, get_bot, AccountStatus
+
+    method = (method or "").lower()
+    targets = [int(x) for x in (target_chat_ids or [])]
+
+    if method in ("bot",):
+        if not bot_id:
+            return False, "Select a forward bot"
+        bot = await get_bot(user_id, bot_id)
+        if not bot:
+            return False, "Selected bot not found"
+        bclient = await get_bot_client(bot)
+        if not bclient:
+            return False, "Could not start selected bot"
+        if check_source:
+            try:
+                schat = await bclient.get_chat(source_chat_id)
+                is_private = not bool(getattr(schat, "username", None))
+            except Exception as e:
+                return False, (
+                    f"Selected bot cannot access source (`{type(e).__name__}`). "
+                    "Private source → bot must be admin there."
+                )
+            if is_private:
+                ok, msg = await check_bot_access_to_source(bclient, source_chat_id, True)
+                if not ok:
+                    return False, f"Selected bot on private source: {msg}"
+        if check_targets:
+            if not targets:
+                return False, "Select at least one target"
+            for tid in targets:
+                ok, msg = await check_admin_in_target(bclient, tid)
+                if not ok:
+                    return False, f"Selected bot on target `{tid}`: {msg}"
+        return True, "OK"
+
+    # user method
+    ids = [str(a) for a in (account_ids or [])]
+    if not ids:
+        return False, "Select at least one user account"
+    for aid in ids:
+        acc = await get_account(user_id, aid)
+        if not acc:
+            return False, f"Account `{aid}` not found"
+        if (acc.get("status") or "") != AccountStatus.ACTIVE.value:
+            return False, f"Account `{aid}` is not active"
+        uclient = await get_user_client(acc)
+        if not uclient:
+            return False, f"Could not start account `{aid}`"
+        if check_source:
+            ok, msg = await check_user_access_to_source(uclient, source_chat_id)
+            if not ok:
+                return False, (
+                    f"Selected account `{aid}` on source: must be at least a member — {msg}"
+                )
+        if check_targets:
+            if not targets:
+                return False, "Select at least one target"
+            for tid in targets:
+                ok, msg = await check_admin_in_target(uclient, tid)
+                if not ok:
+                    return False, (
+                        f"Selected account `{aid}` on target `{tid}`: must be admin/owner — {msg}"
+                    )
+    return True, "OK"

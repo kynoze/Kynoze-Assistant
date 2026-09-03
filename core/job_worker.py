@@ -187,7 +187,7 @@ async def resume_jobs_waiting_on_accounts() -> int:
 
 
 async def progress_ui_refresh_loop(app: Client):
-    """Edit bound job progress messages on user interval (1m–1d, default 5m)."""
+    """Edit ONLY explicitly enabled + bound progress messages (default OFF)."""
     from datetime import datetime, timezone
     from handlers.jobs_handlers import job_detail_text, job_controls_keyboard
     while True:
@@ -196,9 +196,16 @@ async def progress_ui_refresh_loop(app: Client):
             now = datetime.now(timezone.utc)
             try:
                 jobs = await db.forward_jobs.find({
-                    "status": JobStatus.RUNNING.value,
-                    "progress_message_id": {"$ne": None},
-                    "progress_chat_id": {"$ne": None},
+                    "progress_ui_enabled": True,
+                    "progress_message_id": {"$ne": None, "$exists": True},
+                    "progress_chat_id": {"$ne": None, "$exists": True},
+                    "status": {"$in": [
+                        JobStatus.RUNNING.value,
+                        JobStatus.PAUSED.value,
+                        JobStatus.COMPLETED.value,
+                        JobStatus.CANCELLED.value,
+                        JobStatus.FAILED.value,
+                    ]},
                 }).to_list(200)
             except Exception:
                 continue
@@ -224,15 +231,19 @@ async def progress_ui_refresh_loop(app: Client):
                     if not chat_id or not msg_id or not user_id or not job_id:
                         continue
                     fresh = await get_job(user_id, job_id) or job
-                    if (fresh.get("status") or "").lower() != JobStatus.RUNNING.value:
+                    if not fresh.get("progress_ui_enabled"):
                         continue
+                    if not fresh.get("progress_chat_id") or not fresh.get("progress_message_id"):
+                        continue
+                    st = (fresh.get("status") or "").lower()
                     text = job_detail_text(fresh)
                     from handlers.ui import fmt_interval
-                    text += (
-                        f"\n\n⏱ **Progress auto-update:** "
-                        f"`{fmt_interval(job_progress_ui_interval(fresh))}` "
-                        f"(auto · 30m–1d)"
-                    )
+                    if st == JobStatus.RUNNING.value:
+                        text += (
+                            chr(10) + chr(10) + "Progress auto-update: ON - "
+                            + fmt_interval(job_progress_ui_interval(fresh))
+                            + " (this message)"
+                        )
                     try:
                         await app.edit_message_text(
                             chat_id,
@@ -241,15 +252,30 @@ async def progress_ui_refresh_loop(app: Client):
                             reply_markup=job_controls_keyboard(fresh),
                         )
                     except Exception as e:
-                        # message deleted / not modified — unbind on hard failure
                         err = str(e).lower()
-                        if "message" in err and ("not" in err or "modify" in err or "id" in err):
+                        name = type(e).__name__
+                        if name == "MessageNotModified":
+                            pass
+                        elif "message" in err and (
+                            "not" in err or "modify" in err or "id" in err or "invalid" in err
+                        ):
                             await update_job(user_id, job_id, {
                                 "progress_message_id": None,
                                 "progress_chat_id": None,
+                                "progress_ui_enabled": False,
                             })
                         continue
-                    await update_job(user_id, job_id, {"progress_ui_last_at": now})
+                    if st in (
+                        JobStatus.COMPLETED.value,
+                        JobStatus.CANCELLED.value,
+                        JobStatus.FAILED.value,
+                    ):
+                        await update_job(user_id, job_id, {
+                            "progress_ui_enabled": False,
+                            "progress_ui_last_at": now,
+                        })
+                    else:
+                        await update_job(user_id, job_id, {"progress_ui_last_at": now})
                 except Exception:
                     logger.exception("progress_ui refresh one job")
         except asyncio.CancelledError:
@@ -817,6 +843,7 @@ async def forward_job_range(
             job_id, i + 1, len(targets), target_chat_id, msg_skip, end_id,
         )
 
+        op_f = (job.get("filters") if job else None)
         stats = await forward_messages(
             client=client,
             user_id=user_id,
@@ -825,6 +852,7 @@ async def forward_job_range(
             last_msg_id=end_id,
             skip=msg_skip,
             job_id=job_id,
+            op_filters=op_f,
             account_id=current_account_id,
             account_ids=account_ids,
             strategy=strategy,

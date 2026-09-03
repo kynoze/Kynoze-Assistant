@@ -69,16 +69,21 @@ async def _send(chat_id: int, text: str) -> tuple[bool, str]:
     body = _clip(text)
     try:
         try:
+            from pyrogram.types import LinkPreviewOptions
             await bot.send_message(
                 int(chat_id),
                 body,
-                link_preview_options={"is_disabled": True},
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
             )
-        except TypeError:
-            # older pyrogram
-            await bot.send_message(int(chat_id), body, disable_web_page_preview=True)
         except Exception:
-            await bot.send_message(int(chat_id), body)
+            try:
+                await bot.send_message(
+                    int(chat_id),
+                    body,
+                    link_preview_options={"is_disabled": True},
+                )
+            except Exception:
+                await bot.send_message(int(chat_id), body)
         return True, "ok"
     except Exception as e:
         logger.warning("log-chat send to %s failed: %s", chat_id, e)
@@ -277,14 +282,17 @@ async def report_owner(
 
 
 class OwnerLogHandler(logging.Handler):
-    """Forward WARNING+ app logs to owner log chat (async, rate-limited).
+    """Forward WARNING+ to owner log chat, including Pyrogram/library warnings.
 
-    Skips noisy library loggers (pyrogram, pymongo, asyncio, etc.).
+    Still skips ultra-noisy transport loggers. Deprecation warnings are
+    included but heavily rate-limited so owner chat is not flooded.
     """
 
+    # Only skip pure transport / connection spam (not useful in owner chat)
     _SKIP_PREFIXES = (
-        "pyrogram", "pymongo", "asyncio", "urllib3", "httpx",
+        "pymongo", "asyncio", "urllib3", "httpx",
         "motor", "aiohttp", "charset_normalizer",
+        "pyrogram.session", "pyrogram.connection", "pyrogram.network",
     )
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -294,14 +302,10 @@ class OwnerLogHandler(logging.Handler):
         for pref in self._SKIP_PREFIXES:
             if name == pref or name.startswith(pref + "."):
                 return
-        # Ignore pure deprecation noise even if somehow not filtered
         try:
             raw = record.getMessage()
         except Exception:
             raw = ""
-        low = (raw or "").lower()
-        if "deprecated" in low or "will be removed" in low:
-            return
         try:
             msg = self.format(record)
         except Exception:
@@ -310,29 +314,52 @@ class OwnerLogHandler(logging.Handler):
         if record.exc_info:
             tb = "".join(traceback.format_exception(*record.exc_info))
         level = "ERROR" if record.levelno >= logging.ERROR else "WARNING"
+        low = (raw or "").lower()
+        is_deprecation = "deprecated" in low or "will be removed" in low
+        # Rate key: deprecations collapse by message fingerprint; others by logger
+        if is_deprecation:
+            rate_key = f"ownlog:depr:{(raw or '')[:120]}"
+            window = 300.0  # same deprecation at most once per 5 min
+        else:
+            rate_key = f"ownlog:{name}:{record.funcName}:{(raw or '')[:80]}"
+            window = OWNER_RATE_SEC
+        if not _should_rate(rate_key, window):
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
+        title = f"{record.name}"
+        if record.funcName and record.funcName != "<module>":
+            title = f"{record.name}: {record.funcName}"
+        if is_deprecation:
+            title = f"Pyrogram/lib deprecation · {title}"
         loop.create_task(
             report_owner(
                 level,
-                f"{record.name}: {record.funcName}",
+                title,
                 msg,
                 extra=tb or None,
             )
         )
 
 
+
 def install_owner_log_handler() -> None:
     root = logging.getLogger()
-    for h in root.handlers:
+    for h in list(root.handlers):
         if isinstance(h, OwnerLogHandler):
             return
     h = OwnerLogHandler()
     h.setLevel(logging.WARNING)
     h.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
     root.addHandler(h)
+    # Also attach to pyrogram so WARNING deprecations always reach owner chat
+    # even if propagation is disabled somewhere.
+    pyro = logging.getLogger("pyrogram")
+    if not any(isinstance(x, OwnerLogHandler) for x in pyro.handlers):
+        pyro.addHandler(h)
+        pyro.setLevel(logging.WARNING)
 
 
 async def report_user_job_complete(

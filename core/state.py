@@ -22,6 +22,10 @@ STATE_NAMES = (
     "log_chat_state",
     "cnl_rvia_state",
     "job_progress_ui_state",
+    "job_interval_state",
+    "jobs_log_channel_state",
+    "job_filter_state",
+    "qf_filter_state",
     "job_acc_state",
 )
 

@@ -103,11 +103,33 @@ class ForwardStats:
         )
 
 
-async def _edit_progress(progress_message: Optional[Message], text: str):
+def _qf_progress_keyboard():
+    """Inline controls for Quick Forward progress message."""
+    from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⏸ Pause", callback_data="qf:pause"),
+            InlineKeyboardButton("▶️ Resume", callback_data="qf:resume"),
+        ],
+        [
+            InlineKeyboardButton("⏹ Cancel", callback_data="qf:cancel"),
+            InlineKeyboardButton("🔄 Refresh", callback_data="qf:refresh"),
+        ],
+    ])
+
+
+async def _edit_progress(
+    progress_message: Optional[Message],
+    text: str,
+    reply_markup=None,
+):
     if not progress_message:
         return
     try:
-        await progress_message.edit_text(text)
+        kwargs = {}
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
+        await progress_message.edit_text(text, **kwargs)
     except Exception:
         pass
 
@@ -185,12 +207,17 @@ async def _send_text(
             return
         except Exception:
             logger.debug("send_rich_message failed — falling back to send_message", exc_info=True)
+    try:
+        from pyrogram.types import LinkPreviewOptions
+        _lp = {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
+    except Exception:
+        _lp = {"link_preview_options": {"is_disabled": True}}
     await client.send_message(
         chat_id=target_chat_id,
         text=text,
         parse_mode=ParseMode.HTML,
         reply_markup=reply_markup,
-        disable_web_page_preview=True,
+        **_lp,
     )
 
 
@@ -268,9 +295,13 @@ async def forward_messages(
         ]
     ] = None,
     allow_empty_range: bool = False,
+    op_filters: Optional[Dict[str, Any]] = None,
+    pause_flag: Optional[Dict] = None,
+    auto_progress: bool = True,
     bot_id: Optional[str] = None,
 ):
-    settings = target.get("settings", {}) or {}
+    from core.op_filters import merge_settings_for_forward
+    settings = merge_settings_for_forward(target.get("settings", {}) or {}, op_filters)
     target_chat_id = target["chat_id"]
     delay = float(settings.get("delay", 1.0) or 0)
     forward_tag = bool(settings.get("forward_tag", False))
@@ -286,11 +317,31 @@ async def forward_messages(
 
     stats = ForwardStats()
     CANCEL = cancel_flag or {}
+    PAUSE = pause_flag or {}
+    # Keep QF control buttons on progress edits when auto_progress is off
+    progress_kb = None if auto_progress else _qf_progress_keyboard()
 
     current_client = client
     current_account_id = account_id
 
     title = target.get("title") or str(target_chat_id)
+    try:
+        from handlers.source_handler import QF_PROGRESS
+        if not auto_progress:
+            QF_PROGRESS[user_id] = {
+                "status": "running",
+                "title": title,
+                "last_msg_id": last_msg_id,
+                "skip": skip,
+                "current_id": skip,
+                "stats": {
+                    "fetched": 0, "forwarded": 0,
+                    "skipped_filter": 0, "skipped_duplicate": 0,
+                    "skipped_deleted": 0, "errors": 0,
+                },
+            }
+    except Exception:
+        pass
 
     if last_msg_id <= skip and not allow_empty_range:
         await _edit_progress(
@@ -298,6 +349,7 @@ async def forward_messages(
             f"**Nothing to forward**\n\n"
             f"Skip `{skip}` >= last `{last_msg_id}`.\n"
             f"Target: {title}",
+            reply_markup=progress_kb,
         )
         return stats
 
@@ -307,19 +359,35 @@ async def forward_messages(
         f"Target: **{title}**\n"
         f"Range: `{skip + 1}` → `{last_msg_id}`\n"
         f"Send `cancel` to stop.",
+        reply_markup=progress_kb,
     )
 
     try:
         async for message in custom_iter_messages(
             current_client, source_chat_id, limit=last_msg_id, offset=skip
         ):
+            while PAUSE.get(user_id) and not CANCEL.get(user_id):
+                await asyncio.sleep(0.5)
+                if job_id:
+                    from database import get_job
+                    fresh = await get_job(user_id, job_id)
+                    if not fresh or fresh.get("status") != JobStatus.RUNNING.value:
+                        return stats
+
             if CANCEL.get(user_id):
                 if job_id:
                     await set_job_status(user_id, job_id, JobStatus.CANCELLED.value)
                 await _edit_progress(
                     progress_message,
                     f"**Cancelled**\n\n{stats.summary()}",
+                    reply_markup=None,
                 )
+                try:
+                    from handlers.source_handler import QF_PROGRESS
+                    if user_id in QF_PROGRESS and not auto_progress:
+                        QF_PROGRESS[user_id]["status"] = "cancelled"
+                except Exception:
+                    pass
                 return stats
 
             if job_id:
@@ -331,6 +399,27 @@ async def forward_messages(
 
             stats.fetched += 1
 
+            try:
+                from handlers.source_handler import QF_PROGRESS
+                if user_id in QF_PROGRESS and not auto_progress:
+                    QF_PROGRESS[user_id]["current_id"] = message.id
+                    QF_PROGRESS[user_id]["stats"] = {
+                        "fetched": stats.fetched,
+                        "forwarded": stats.forwarded,
+                        "skipped_filter": stats.skipped_filter,
+                        "skipped_duplicate": stats.skipped_duplicate,
+                        "skipped_deleted": stats.skipped_deleted,
+                        "errors": stats.errors,
+                    }
+                    if PAUSE.get(user_id):
+                        QF_PROGRESS[user_id]["status"] = "paused"
+                    elif CANCEL.get(user_id):
+                        QF_PROGRESS[user_id]["status"] = "cancelled"
+                    else:
+                        QF_PROGRESS[user_id]["status"] = "running"
+            except Exception:
+                pass
+
             should, reason = should_process_message(message, settings)
             if not should:
                 if reason == "deleted":
@@ -341,10 +430,11 @@ async def forward_messages(
                     await update_job_stats(
                         user_id, job_id, {"fetched": 1}, current_msg_id=message.id
                     )
-                if progress_message and stats.fetched % PROGRESS_EVERY == 0:
+                if auto_progress and progress_message and stats.fetched % PROGRESS_EVERY == 0:
                     await _edit_progress(
                         progress_message,
                         f"**Forwarding…** `{message.id}` / `{last_msg_id}`\n\n{stats.summary()}",
+                        reply_markup=progress_kb,
                     )
                 continue
 
@@ -462,6 +552,7 @@ async def forward_messages(
                                 await _edit_progress(
                                     progress_message,
                                     f"**Paused** — all accounts sleeping\n\n{stats.summary()}",
+                                    reply_markup=progress_kb,
                                 )
                                 return stats
                 await increment_stats(
@@ -519,6 +610,7 @@ async def forward_messages(
                 await _edit_progress(
                     progress_message,
                     f"**Paused** — account error\n\n{stats.summary()}",
+                    reply_markup=progress_kb,
                 )
                 return stats
 
@@ -531,12 +623,13 @@ async def forward_messages(
                     )
                 continue
 
-            if progress_message and (
+            if auto_progress and progress_message and (
                 stats.forwarded % PROGRESS_EVERY == 0 or stats.fetched % PROGRESS_EVERY == 0
             ):
                 await _edit_progress(
                     progress_message,
                     f"**Forwarding…** `{message.id}` / `{last_msg_id}`\n\n{stats.summary()}",
+                    reply_markup=progress_kb,
                 )
 
             if delay > 0:
@@ -562,11 +655,13 @@ async def forward_messages(
         await _edit_progress(
             progress_message,
             f"**Failed**\n\n{stats.summary()}\n\nError: `{e}`",
+            reply_markup=None,
         )
         raise
 
     await _edit_progress(
         progress_message,
         f"**Done** — {title}\n\n{stats.summary()}",
+        reply_markup=None,
     )
     return stats
