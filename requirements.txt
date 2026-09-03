@@ -1,7 +1,11 @@
-kurigram==2.2.25
-pymongo[srv]==4.17.0
-python-dotenv>=1.0.0
-tgcrypto>=1.2.5
+kurigram
+pymongo
+python-dotenv
+tgcrypto
 PyNaCl
-dnspython>=2.6.0
+dnspython
 parsett
+#web
+Flask
+gunicorn
+aiohttp
