@@ -83,6 +83,12 @@ async def main():
     except Exception:
         logger.exception("Progress UI loop start skipped")
     try:
+        from core.jobs_log import jobs_log_refresh_loop
+        asyncio.create_task(jobs_log_refresh_loop(app))
+        logger.info("Jobs Log Channel refresh loop started")
+    except Exception:
+        logger.exception("Jobs Log loop start skipped")
+    try:
         from core.delete_manager.worker import delete_monitor_loop
         asyncio.create_task(delete_monitor_loop(app))
         logger.info("Delete Manager monitor started")

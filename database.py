@@ -970,6 +970,13 @@ async def create_job(
         "started_at": None,
         "completed_at": None,
         "error_message": None,
+        "filters": {
+            "media_types": ["video", "document"],
+            "block_enabled": False,
+            "block_words": [],
+            "whitelist_enabled": False,
+            "whitelist_words": [],
+        },
         "created_at": now,
         "updated_at": now
     }
@@ -1332,6 +1339,118 @@ def clamp_progress_ui_interval(raw, *, allow_fast: bool = False) -> int:
     if n in OWNER_ONLY_PROGRESS_UI and not allow_fast:
         return MIN_PROGRESS_UI_INTERVAL
     return max(MIN_PROGRESS_UI_INTERVAL, min(MAX_PROGRESS_UI_INTERVAL, n))
+
+
+# ── Jobs Log Channel (per-user + per-job binding) ─────────────────
+DEFAULT_LOG_PROGRESS_INTERVAL = 5 * 60  # 5 min
+OWNER_ONLY_LOG_PROGRESS_UI = {60, 120}  # 1m, 2m
+
+
+async def get_jobs_log_channel(user_id: int) -> dict:
+    user = await get_user(user_id) or {}
+    return {
+        "chat_id": user.get("jobs_log_channel_id"),
+        "title": user.get("jobs_log_channel_title"),
+        "username": user.get("jobs_log_channel_username"),
+    }
+
+
+async def set_jobs_log_channel(
+    user_id: int,
+    chat_id: int | None,
+    title: str | None = None,
+    username: str | None = None,
+) -> bool:
+    await ensure_user(user_id)
+    if chat_id is None:
+        await db.users.update_one(
+            {"user_id": user_id},
+            {
+                "$unset": {
+                    "jobs_log_channel_id": "",
+                    "jobs_log_channel_title": "",
+                    "jobs_log_channel_username": "",
+                },
+                "$set": {"updated_at": datetime.now(timezone.utc)},
+            },
+        )
+        return True
+    await db.users.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "jobs_log_channel_id": int(chat_id),
+                "jobs_log_channel_title": title or str(chat_id),
+                "jobs_log_channel_username": username,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        },
+    )
+    return True
+
+
+def job_log_progress_interval(job) -> int:
+    try:
+        n = int((job or {}).get("log_progress_auto_update_interval") or DEFAULT_LOG_PROGRESS_INTERVAL)
+    except (TypeError, ValueError):
+        n = DEFAULT_LOG_PROGRESS_INTERVAL
+    if n in OWNER_ONLY_LOG_PROGRESS_UI:
+        return n
+    return max(MIN_PROGRESS_UI_INTERVAL, min(MAX_PROGRESS_UI_INTERVAL, n))
+
+
+async def clear_job_log_binding(user_id: int, job_id: str) -> bool:
+    return await update_job(
+        user_id,
+        job_id,
+        {
+            "log_progress_chat_id": None,
+            "log_progress_message_id": None,
+            "log_progress_last_at": None,
+        },
+    )
+
+
+async def try_bind_job_log_message(
+    user_id: int,
+    job_id: str,
+    chat_id: int,
+    message_id: int,
+) -> bool:
+    """Atomic bind only if no existing binding (race-safe)."""
+    now = datetime.now(timezone.utc)
+    result = await db.forward_jobs.update_one(
+        {
+            "user_id": user_id,
+            "job_id": job_id,
+            "$or": [
+                {"log_progress_message_id": {"$exists": False}},
+                {"log_progress_message_id": None},
+            ],
+        },
+        {
+            "$set": {
+                "log_progress_chat_id": int(chat_id),
+                "log_progress_message_id": int(message_id),
+                "log_progress_last_at": now,
+                "updated_at": now,
+            }
+        },
+    )
+    return result.modified_count > 0
+
+
+async def get_jobs_with_log_auto_update() -> list:
+    """Jobs that have a log message binding and auto-update enabled."""
+    return await db.forward_jobs.find(
+        {
+            "log_progress_message_id": {"$ne": None, "$exists": True},
+            "log_progress_chat_id": {"$ne": None, "$exists": True},
+            "log_progress_auto_update_enabled": True,
+            "status": {"$in": [JobStatus.RUNNING.value, JobStatus.PAUSED.value, "indexing"]},
+        }
+    ).to_list(length=500)
+
 
 def job_monitor_interval(job: Optional[Dict[str, Any]]) -> int:
     """Persisted interval with safe default for old jobs. Max 10 days."""
