@@ -83,7 +83,7 @@ async def index_message_to_db(
     media_type, media, caption, file_uid = extracted
     if not caption:
         return "skip"
-    details = extract_details(caption)
+    details = extract_details(caption or "")
     link = getattr(message, "link", None) or build_message_link(
         source_chat_id, message.id, source_username
     )
@@ -146,22 +146,25 @@ async def run_initial_index(
             "range_start": range_start,
             "total_est": total_est,
             "pct": 0,
+            "status_chat_id": getattr(getattr(status_message, "chat", None), "id", None),
+            "status_message_id": getattr(status_message, "id", None),
         }
         current = range_start
         BATCH = 80
         last_ui = 0.0
 
         async def _maybe_ui(force: bool = False):
+            """Only update Telegram on force=True (final / explicit). No periodic edits."""
             nonlocal last_ui
             now = time.time()
-            if not force and (now - last_ui) < 2.5:
-                return
-            last_ui = now
             p = PROGRESS.get(owner_user_id) or {}
             p["elapsed"] = now - start
             done = max(0, current - range_start)
             p["pct"] = int(min(99, round(100.0 * done / total_est))) if total_est else 0
             p["current_id"] = current
+            if not force:
+                return
+            last_ui = now
             try:
                 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
                 kb = InlineKeyboardMarkup([
@@ -179,13 +182,18 @@ async def run_initial_index(
             if current >= end_id:
                 PROGRESS[owner_user_id]["status"] = "done"
                 PROGRESS[owner_user_id]["pct"] = 100
-                await status_message.edit_text("⚠️ No messages in range.")
+                await _maybe_ui(True)
+                try:
+                    await status_message.edit_text("⚠️ No messages in range.")
+                except Exception:
+                    pass
                 return
 
             await _maybe_ui(force=True)
             while current < end_id:
                 if CANCEL.get(owner_user_id):
                     PROGRESS[owner_user_id]["status"] = "cancelled"
+                    await _maybe_ui(True)
                     break
 
                 batch_end = min(current + BATCH, end_id)
@@ -200,13 +208,13 @@ async def run_initial_index(
                 except RPCError:
                     PROGRESS[owner_user_id]["errors"] += len(ids)
                     current = batch_end
-                    await _maybe_ui()
+                    await _maybe_ui(False)
                     continue
                 except Exception:
                     logger.exception("wroxen get_messages")
                     PROGRESS[owner_user_id]["errors"] += len(ids)
                     current = batch_end
-                    await _maybe_ui()
+                    await _maybe_ui(False)
                     continue
 
                 if not isinstance(messages, list):
@@ -236,7 +244,7 @@ async def run_initial_index(
 
                 current = batch_end
                 PROGRESS[owner_user_id]["current_id"] = current
-                await _maybe_ui()
+                await _maybe_ui(False)
                 await asyncio.sleep(0.05)
 
             p = PROGRESS[owner_user_id]
@@ -310,5 +318,22 @@ def _fmt(p: Dict[str, Any]) -> str:
 
 
 def format_live(uid: int) -> Optional[str]:
+    """Fresh snapshot for Refresh button — recompute elapsed/pct."""
     p = get_progress(uid)
-    return _fmt(p) if p else None
+    if not p:
+        return None
+    try:
+        start = float(p.get("start_time") or time.time())
+        p["elapsed"] = max(0.0, time.time() - start)
+        range_start = int(p.get("range_start") or 0)
+        end_id = int(p.get("end_id") or 0)
+        current = int(p.get("current_id") or range_start)
+        total_est = max(0, end_id - range_start) or int(p.get("total_est") or 0)
+        if (p.get("status") or "") == "done":
+            p["pct"] = 100
+        elif total_est > 0:
+            done = max(0, current - range_start)
+            p["pct"] = int(min(99, round(100.0 * done / total_est)))
+    except Exception:
+        pass
+    return _fmt(p)

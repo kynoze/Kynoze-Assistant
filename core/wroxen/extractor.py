@@ -1,50 +1,37 @@
-"""Media title/metadata extraction for Wroxen — PTT (parsett) + manual lang/quality.
+"""Wroxen media title/metadata extraction — exact extract_details (PTT + manual lang/quality).
 
-Uses tested extract_details logic with `from PTT import parse_title`.
-Install: pip install parsett
+Requires: pip install parsett
 """
 
 from __future__ import annotations
 
-import logging
 import re
 from typing import Any, Dict, Optional
 
-logger = logging.getLogger(__name__)
-
-try:
-    from PTT import parse_title
-    _HAS_PTT = True
-except ImportError:  # pragma: no cover
-    parse_title = None  # type: ignore
-    _HAS_PTT = False
-    logger.warning("parsett (PTT) not installed — pip install parsett")
+from PTT import parse_title
 
 
-def extract_details(caption: Optional[str]) -> Dict[str, Any]:
+def extract_details(caption: str):
     if not caption or len(caption.strip()) < 2:
         return {}
 
-    data: Dict[str, Any] = {}
-    if _HAS_PTT and parse_title is not None:
-        try:
-            data = parse_title(caption, translate_languages=True) or {}
-        except Exception as e:
-            logger.debug("PTT parse error: %s", e)
-            data = {}
-    else:
+    # --- Parse using PTT (except lang & quality) ---
+    try:
+        data = parse_title(caption, translate_languages=True) or {}
+    except Exception as e:
+        print(f"[PTT Error] {e}")
         data = {}
 
     # ---------- Manual Language Extraction ----------
     lang_match = re.search(
-        r"\[([^\]]*?(?:Hin|Hindi|Tam|Tamil|Tel|Telugu|Eng|English|Kan|Kannada|"
-        r"Mal|Malayalam|Beng|Bengali|Mar|Marathi)[^\]]*?)\]",
+        r"\[([^\]]*?(?:Hin|Hindi|Tam|Tamil|Tel|Telugu|Eng|English|Kan|Kannada|Mal|Malayalam|Beng|Bengali|Mar|Marathi)[^\]]*?)\]",
         caption,
-        re.IGNORECASE,
+        re.IGNORECASE
     )
     lang = None
     if lang_match:
         raw_lang = lang_match.group(1)
+        # remove quotes, brackets, parentheses etc.
         raw_lang = re.sub(r"['\"\[\]\(\)]", "", raw_lang).strip()
         langs = re.split(r"[+,/&\-]", raw_lang)
         langs = [x.strip().capitalize() for x in langs if x.strip()]
@@ -64,25 +51,21 @@ def extract_details(caption: Optional[str]) -> Dict[str, Any]:
     title = data.get("title")
     year = data.get("year")
     codec = data.get("codec")
-    codec = codec.upper() if isinstance(codec, str) else None
+    codec = codec.upper() if codec else None
     print_type = data.get("quality") or data.get("source")
 
     # ---------- Season & Episode ----------
-    seasons = data.get("seasons") or []
+    seasons = data.get("seasons", [])
     season = seasons[0] if seasons else None
 
-    episodes = data.get("episodes") or []
+    episodes = data.get("episodes", [])
     episode = None
     caption_lower = caption.lower()
 
     if "complete" in caption_lower:
         episode = "Complete"
     elif episodes:
-        episode = (
-            f"{episodes[0]}-{episodes[-1]}"
-            if len(episodes) > 1
-            else str(episodes[0])
-        )
+        episode = f"{episodes[0]}-{episodes[-1]}" if len(episodes) > 1 else str(episodes[0])
     else:
         ep_match = re.search(
             r"(?:E|Ep|Episode)\s*(\d{1,3})(?:\s*(?:-|to)\s*(\d{1,3}))?",
@@ -92,11 +75,6 @@ def extract_details(caption: Optional[str]) -> Dict[str, Any]:
         if ep_match:
             start, end = ep_match.groups()
             episode = f"{start}-{end}" if end else start
-
-    # If PTT missing title, rough first-line fallback so indexing still works
-    if not title:
-        first = caption.strip().split("\n", 1)[0][:120].strip()
-        title = first or None
 
     return {
         "title": title,

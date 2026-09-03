@@ -193,10 +193,15 @@ async def start_bot_for_config(cfg: Dict[str, Any]) -> Optional[Client]:
                 text += format_result_line(i, movie)
 
             kb = pagination_keyboard(wroxen_id, query, 1, pages, message.from_user.id)
+            try:
+                from pyrogram.types import LinkPreviewOptions
+                _lp = {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
+            except Exception:
+                _lp = {"link_preview_options": {"is_disabled": True}}
             await message.reply_text(
                 text,
                 reply_markup=kb,
-                disable_web_page_preview=True,
+                **_lp,
             )
         except FloodWait as e:
             await asyncio.sleep(e.value)
@@ -253,8 +258,13 @@ async def start_bot_for_config(cfg: Dict[str, Any]) -> Optional[Client]:
             text += format_result_line(i, movie)
         kb = pagination_keyboard(wroxen_id, query, page, pages, owner_id)
         try:
+            try:
+                from pyrogram.types import LinkPreviewOptions
+                _lp = {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
+            except Exception:
+                _lp = {"link_preview_options": {"is_disabled": True}}
             await cq.message.edit_text(
-                text, reply_markup=kb, disable_web_page_preview=True
+                text, reply_markup=kb, **_lp
             )
             await cq.answer()
         except MessageNotModified:
