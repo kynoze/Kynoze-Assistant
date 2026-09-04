@@ -20,6 +20,8 @@ from database import (
     ensure_user,
     get_user_bots,
     get_bot,
+    get_user_accounts,
+    get_account,
     get_wroxen_db_uri_plain,
     set_wroxen_db_uri,
     create_wroxen_config,
@@ -34,7 +36,7 @@ from core.wroxen import db as wxdb
 from core.wroxen.db import mask_uri
 from core.wroxen.indexer import run_initial_index, request_cancel, format_live, is_running
 from core.wroxen.search import clear_cache_for_wroxen
-from core.job_worker import get_bot_client
+from core.job_worker import get_bot_client, get_user_client
 from handlers.ui import safe_edit, safe_answer
 
 logger = logging.getLogger(__name__)
@@ -63,6 +65,8 @@ def _config_kb(wroxen_id: str) -> InlineKeyboardMarkup:
                               callback_data=f"wx:stats:{wroxen_id}")],
         [InlineKeyboardButton("▶️ Start / Re-index",
                               callback_data=f"wx:reindex:{wroxen_id}")],
+        [InlineKeyboardButton("👤 Change Index Account",
+                              callback_data=f"wx:chgacc:{wroxen_id}")],
         [InlineKeyboardButton("🗑 Clear Index",
                               callback_data=f"wx:clear:{wroxen_id}")],
         [
@@ -74,6 +78,48 @@ def _config_kb(wroxen_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("« Back",
                               callback_data="wx:list")],
     ])
+
+
+async def _account_picker_kb(user_id: int, prefix: str) -> InlineKeyboardMarkup:
+    """Build account selection keyboard. prefix e.g. wx:pickacc: or wx:setacc:WID:"""
+    accounts = await get_user_accounts(user_id)
+    from handlers.ui import format_account_label
+    rows = []
+    for acc in accounts:
+        if acc.get("status") in ("error", "banned"):
+            continue
+        label = format_account_label(acc, short=True)[:40]
+        rows.append([
+            InlineKeyboardButton(
+                f"👤 {label}",
+                callback_data=f"{prefix}{acc['account_id']}",
+            )
+        ])
+    rows.append([
+        InlineKeyboardButton("🤖 Use Bot only (no userbot)", callback_data=f"{prefix}bot")
+    ])
+    rows.append([InlineKeyboardButton("« Cancel", callback_data="wx:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _check_account_member(account_doc: dict, source_chat_id: int) -> Optional[str]:
+    """Return error string if account is not a member of source chat, else None."""
+    try:
+        uc = await get_user_client(account_doc)
+        if not uc:
+            return "❌ Could not start selected account session."
+        from core.permissions import fetch_member, is_member_or_above
+        m, err = await fetch_member(uc, source_chat_id, "me")
+        if err == "not_participant":
+            return "❌ Selected account must be a **member** of the source chat."
+        if err:
+            return f"❌ Cannot verify account in source chat ({err})."
+        if not is_member_or_above(m):
+            return "❌ Selected account must be a **member** of the source chat."
+        return None
+    except Exception as e:
+        logger.exception("wroxen account membership check")
+        return f"❌ Account membership check failed: {type(e).__name__}"
 
 
 async def _home_text(user_id: int) -> str:
@@ -175,8 +221,16 @@ async def wroxen_callbacks(client: Client, query: CallbackQuery):
             await query.answer("Not found", show_alert=True)
             return
         bot = await get_bot(user_id, cfg["bot_id"])
-        from handlers.ui import format_bot_label
+        from handlers.ui import format_bot_label, format_account_label
         bot_name = format_bot_label(bot, short=True) if bot else "?"
+        acc_line = "Bot only"
+        aid = cfg.get("index_account_id")
+        if aid:
+            acc = await get_account(user_id, aid)
+            if acc:
+                acc_line = format_account_label(acc, short=True)
+            else:
+                acc_line = f"`{aid[:8]}…` (missing)"
         uri = await get_wroxen_db_uri_plain(user_id)
         count = 0
         if uri:
@@ -187,6 +241,7 @@ async def wroxen_callbacks(client: Client, query: CallbackQuery):
         text = (
             f"**🔎 {cfg.get('name', 'Wroxen')}**\n\n"
             f"🤖 Bot: **{bot_name}**\n"
+            f"👤 Index account: **{acc_line}**\n"
             f"📥 Source: **{cfg.get('source_title') or cfg['source_chat_id']}**\n"
             f"🎯 Target: **{cfg.get('target_title') or cfg['target_chat_id']}**\n\n"
             f"📊 Indexed: **{count:,}**\n"
@@ -317,18 +372,53 @@ async def wroxen_callbacks(client: Client, query: CallbackQuery):
             rows.append([InlineKeyboardButton(f"🤖 {name}", callback_data=f"wx:addbot:{b['bot_id']}")])
         rows.append([InlineKeyboardButton("« Cancel", callback_data="wx:home")])
         set_state(client, "wroxen_state", user_id, {"step": "add_bot"})
-        await safe_edit(query, "**➕ Add Wroxen — Select Bot**\n\nSame bot will index + search.", InlineKeyboardMarkup(rows))
+        await safe_edit(
+            query,
+            "**➕ Add Wroxen — Select Bot**\n\n"
+            "1. Bot (search + auto-index)\n"
+            "2. **User account** (full history index) — next step\n"
+            "3. Source → Target → Index",
+            InlineKeyboardMarkup(rows),
+        )
         return await safe_answer(query)
 
     if data.startswith("wx:addbot:"):
         bot_id = data.split(":", 2)[2]
         if not await get_bot(user_id, bot_id):
             return await query.answer("Bot not found", show_alert=True)
-        set_state(client, "wroxen_state", user_id, {"step": "await_source", "bot_id": bot_id})
+        # Next: select index account (userbot) before source
+        accounts = await get_user_accounts(user_id)
+        usable = [a for a in accounts if a.get("status") not in ("error", "banned")]
+        if usable:
+            set_state(
+                client,
+                "wroxen_state",
+                user_id,
+                {"step": "pick_account_add", "bot_id": bot_id},
+            )
+            kb = await _account_picker_kb(user_id, prefix="wx:pickacc:")
+            await safe_edit(
+                query,
+                "**👤 Select account for indexing**\n\n"
+                "Userbot = **full history** (recommended, old Wroxen jaisa).\n"
+                "Account must be a **member** of the source chat.\n\n"
+                "This is saved — re-index pe dobara choose nahi karna padega.\n\n"
+                "Or pick **Use Bot only** if no user account.",
+                kb,
+            )
+            return await safe_answer(query)
+        # No accounts → bot only, go to source
+        set_state(
+            client,
+            "wroxen_state",
+            user_id,
+            {"step": "await_source", "bot_id": bot_id, "index_account_id": None},
+        )
         await safe_edit(
             query,
             "**📥 Source Chat**\n\n"
             "Forward a message from the **source channel**, or send a `t.me` link.\n\n"
+            "_No user accounts found — indexing will use bot only._\n\n"
             "`/cancel` to abort.",
             None,
         )
@@ -341,6 +431,7 @@ async def wroxen_callbacks(client: Client, query: CallbackQuery):
             return await query.answer("Not found", show_alert=True)
         if is_running(user_id):
             return await query.answer("Index already running", show_alert=True)
+        # Reuse saved index_account_id — no re-choice on reindex
         set_state(
             client,
             "wroxen_state",
@@ -353,6 +444,7 @@ async def wroxen_callbacks(client: Client, query: CallbackQuery):
                 "target_chat_id": cfg.get("target_chat_id"),
                 "target_title": cfg.get("target_title"),
                 "bot_id": cfg.get("bot_id"),
+                "index_account_id": cfg.get("index_account_id"),  # may be None → bot only
             },
         )
         await safe_edit(
@@ -361,6 +453,122 @@ async def wroxen_callbacks(client: Client, query: CallbackQuery):
             "Forward the **last message** from the source, or send a t.me link.\n\n"
             "`/cancel` to abort.",
             None,
+        )
+        return await safe_answer(query)
+
+    if data.startswith("wx:chgacc:"):
+        wid = data.split(":", 2)[2]
+        cfg = await get_wroxen_config(user_id, wid)
+        if not cfg:
+            return await query.answer("Not found", show_alert=True)
+        accounts = await get_user_accounts(user_id)
+        if not accounts:
+            return await query.answer("No accounts added. Add an account first.", show_alert=True)
+        kb = await _account_picker_kb(user_id, prefix=f"wx:setacc:{wid}:")
+        await safe_edit(
+            query,
+            "**👤 Select Index Account**\n\n"
+            "This account will be used for bulk indexing (full history).\n"
+            "It must be a **member** of the source chat.\n\n"
+            "Re-index will reuse this choice automatically.",
+            kb,
+        )
+        return await safe_answer(query)
+
+    if data.startswith("wx:setacc:"):
+        # wx:setacc:{wroxen_id}:{account_id|bot}
+        parts = data.split(":")
+        if len(parts) < 4:
+            return await query.answer("Invalid", show_alert=True)
+        wid = parts[2]
+        aid = parts[3]
+        cfg = await get_wroxen_config(user_id, wid)
+        if not cfg:
+            return await query.answer("Not found", show_alert=True)
+        if aid == "bot":
+            await update_wroxen_config(user_id, wid, {"index_account_id": None})
+            await query.answer("Index account cleared (bot only)", show_alert=True)
+        else:
+            acc = await get_account(user_id, aid)
+            if not acc:
+                return await query.answer("Account not found", show_alert=True)
+            # membership check
+            err = await _check_account_member(acc, int(cfg["source_chat_id"]))
+            if err:
+                return await query.answer(err[:180], show_alert=True)
+            await update_wroxen_config(user_id, wid, {"index_account_id": aid})
+            await query.answer("Index account saved", show_alert=True)
+        query.data = f"wx:open:{wid}"
+        return await wroxen_callbacks(client, query)
+
+    if data.startswith("wx:pickacc:"):
+        # wx:pickacc:{account_id|bot}
+        # Used in: (1) add flow after bot  (2) late pick after skip
+        aid = data.split(":", 2)[2]
+        st = get_state(client, "wroxen_state", user_id) or {}
+        step = st.get("step")
+        if step not in ("pick_account_add", "pick_account", "confirm_index"):
+            await query.answer("Session expired — start Add Wroxen again", show_alert=True)
+            return await show_wroxen_home(client, query)
+
+        if aid == "bot":
+            st["index_account_id"] = None
+        else:
+            acc = await get_account(user_id, aid)
+            if not acc:
+                return await query.answer("Account not found", show_alert=True)
+            sid = int(st.get("source_chat_id") or 0)
+            # If source already known → verify membership now
+            if sid:
+                err = await _check_account_member(acc, sid)
+                if err:
+                    return await query.answer(err[:180], show_alert=True)
+            st["index_account_id"] = aid
+
+        # --- Path A: early pick during Add (right after bot) ---
+        if step == "pick_account_add":
+            st["step"] = "await_source"
+            set_state(client, "wroxen_state", user_id, st)
+            from handlers.ui import format_account_label
+            acc_label = "Bot only"
+            if st.get("index_account_id"):
+                acc = await get_account(user_id, st["index_account_id"])
+                if acc:
+                    acc_label = format_account_label(acc, short=True)
+            await safe_edit(
+                query,
+                f"**📥 Source Chat**\n\n"
+                f"Index account: **{acc_label}**\n\n"
+                "Forward a message from the **source channel**, or send a `t.me` link.\n\n"
+                "Account must already be a **member** of that source.\n\n"
+                "`/cancel` to abort.",
+                None,
+            )
+            return await safe_answer(query)
+
+        # --- Path B: late pick (after skip) → confirm ---
+        st["step"] = "confirm_index"
+        set_state(client, "wroxen_state", user_id, st)
+        from handlers.ui import format_account_label
+        acc_label = "Bot only"
+        if st.get("index_account_id"):
+            acc = await get_account(user_id, st["index_account_id"])
+            if acc:
+                acc_label = format_account_label(acc, short=True)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ START INDEX", callback_data="wx:do_index")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="wx:home")],
+        ])
+        await safe_edit(
+            query,
+            f"**📚 Confirm Wroxen Index**\n\n"
+            f"Source: `{st.get('source_chat_id')}`\n"
+            f"Target: `{st.get('target_chat_id', '—')}`\n"
+            f"Last msg: `{st.get('last_msg_id')}`\n"
+            f"Skip: `{st.get('skip', 0)}`\n"
+            f"Index account: **{acc_label}**\n\n"
+            "Userbot indexes full history. Search still uses the bot.",
+            kb,
         )
         return await safe_answer(query)
 
@@ -416,6 +624,24 @@ async def _start_index_job(client: Client, query: CallbackQuery, user_id: int, s
             show_alert=True,
         )
 
+    # Resolve index account (userbot)
+    index_account_id = st.get("index_account_id")
+    user_client = None
+    if index_account_id:
+        acc = await get_account(user_id, index_account_id)
+        if not acc:
+            return await query.answer(
+                "Saved index account missing. Use Change Index Account.",
+                show_alert=True,
+            )
+        # re-check membership at start time
+        err = await _check_account_member(acc, int(st["source_chat_id"]))
+        if err:
+            return await query.answer(err[:180], show_alert=True)
+        user_client = await get_user_client(acc)
+        if not user_client:
+            return await query.answer("Could not start index account client", show_alert=True)
+
     # create config if new
     wid = st.get("wroxen_id")
     if not wid:
@@ -440,12 +666,20 @@ async def _start_index_job(client: Client, query: CallbackQuery, user_id: int, s
         except Exception:
             logger.exception("refresh_routing after create")
 
+    # Persist chosen index account on config (so reindex reuses it)
+    await update_wroxen_config(
+        user_id,
+        wid,
+        {"index_account_id": index_account_id},  # None = bot only
+    )
+
     set_state(client, "wroxen_state", user_id, None)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔄 Refresh", callback_data="wx:idx_prog")],
         [InlineKeyboardButton("❌ Stop", callback_data="wx:idx_stop")],
     ])
-    await safe_edit(query, "📥 Wroxen indexing starting...", kb)
+    mode = "Userbot" if user_client else "Bot"
+    await safe_edit(query, f"📥 Wroxen indexing starting ({mode})...", kb)
     await safe_answer(query)
     asyncio.create_task(run_initial_index(
             owner_user_id=user_id,
@@ -455,6 +689,8 @@ async def _start_index_job(client: Client, query: CallbackQuery, user_id: int, s
             last_msg_id=int(st["last_msg_id"]),
             skip=int(st.get("skip") or 0),
             status_message=query.message,
+            user_client=user_client,
+            index_account_id=index_account_id,
         )
     )
 
@@ -636,6 +872,20 @@ async def handle_wroxen_text(client: Client, message: Message) -> bool:
             st["source_chat_id"] = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
             st["source_title"] = title
             st["last_msg_id"] = int(msg_id)
+            # If index account already chosen, verify membership now
+            if st.get("index_account_id"):
+                acc = await get_account(user_id, st["index_account_id"])
+                if not acc:
+                    await message.reply("❌ Saved index account missing. /cancel and start again.")
+                    return True
+                err = await _check_account_member(acc, int(st["source_chat_id"]))
+                if err:
+                    await message.reply(
+                        f"{err}\n\n"
+                        "Account ko source chat mein **member** banao, phir dubara source bhejo.\n"
+                        "Ya `/cancel` karke **Use Bot only** choose karo."
+                    )
+                    return True
             st["step"] = "await_target"
             set_state(client, "wroxen_state", user_id, st)
             await message.reply(
@@ -661,8 +911,34 @@ async def handle_wroxen_text(client: Client, message: Message) -> bool:
             await message.reply("❌ Non-negative integer or /cancel.")
             return True
         st["skip"] = skip
+
+        # If account still not chosen (e.g. reindex without saved account), offer picker
+        if "index_account_id" not in st:
+            accounts = await get_user_accounts(user_id)
+            usable = [a for a in accounts if a.get("status") not in ("error", "banned")]
+            if usable:
+                st["step"] = "pick_account"
+                set_state(client, "wroxen_state", user_id, st)
+                kb = await _account_picker_kb(user_id, prefix="wx:pickacc:")
+                await message.reply(
+                    "**👤 Select account for indexing**\n\n"
+                    "Userbot gives **full history** (recommended).\n"
+                    "Account must be a **member** of the source chat.\n\n"
+                    "This choice is saved — re-index will reuse it.",
+                    reply_markup=kb,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return True
+            st["index_account_id"] = None
+
         st["step"] = "confirm_index"
         set_state(client, "wroxen_state", user_id, st)
+        from handlers.ui import format_account_label
+        acc_label = "Bot only"
+        if st.get("index_account_id"):
+            acc = await get_account(user_id, st["index_account_id"])
+            if acc:
+                acc_label = format_account_label(acc, short=True)
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ START INDEX", callback_data="wx:do_index")],
             [InlineKeyboardButton("❌ Cancel", callback_data="wx:home")],
@@ -672,7 +948,8 @@ async def handle_wroxen_text(client: Client, message: Message) -> bool:
             f"Source: `{st.get('source_chat_id')}`\n"
             f"Target: `{st.get('target_chat_id', '—')}`\n"
             f"Last msg: `{st.get('last_msg_id')}`\n"
-            f"Skip: `{skip}`\n\n"
+            f"Skip: `{skip}`\n"
+            f"Index account: **{acc_label}**\n\n"
             "Only media will be indexed. Search returns links only.",
             reply_markup=kb,
             parse_mode=ParseMode.MARKDOWN,

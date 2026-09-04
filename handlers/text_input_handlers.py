@@ -558,7 +558,6 @@ async def handle_all_text_input(client: Client, message: Message):
                 )
 
             from core.access import check_limit
-            from database import get_user_targets, get_user_bots, get_user_accounts
 
             err = await check_limit(
                 user_id, "targets", len(await get_user_targets(user_id))
