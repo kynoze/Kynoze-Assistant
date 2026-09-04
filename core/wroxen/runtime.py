@@ -113,10 +113,10 @@ async def start_bot_for_config(cfg: Dict[str, Any]) -> Optional[Client]:
         parse_mode=ParseMode.HTML,
     )
 
-    # Auto-index: media in source chats
+    # Auto-index: video + document only (same as classic Wroxen)
     @client.on_message(
         (filters.channel | filters.group)
-        & (filters.video | filters.document | filters.photo | filters.audio | filters.animation)
+        & (filters.video | filters.document)
     )
     async def _auto_index(c: Client, message: Message):
         try:

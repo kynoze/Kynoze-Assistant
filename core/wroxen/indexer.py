@@ -1,4 +1,8 @@
-"""Initial bulk index of source chat media (bot client only)."""
+"""Initial bulk index of source chat media.
+
+Prefer user account (userbot) via search_messages for complete history.
+Fall back to bot client sequential get_messages when no user account is provided.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +12,7 @@ import time
 from typing import Any, Dict, Optional
 
 from pyrogram import Client
-from pyrogram.enums import MessageMediaType
+from pyrogram.enums import MessageMediaType, MessagesFilter
 from pyrogram.errors import FloodWait, RPCError
 
 from core.wroxen.db import save_media
@@ -16,12 +20,10 @@ from core.wroxen.extractor import build_message_link, extract_details
 
 logger = logging.getLogger(__name__)
 
+# Only video + document (same as classic Wroxen)
 SUPPORTED = {
     MessageMediaType.VIDEO: "video",
     MessageMediaType.DOCUMENT: "document",
-    MessageMediaType.PHOTO: "photo",
-    MessageMediaType.AUDIO: "audio",
-    MessageMediaType.ANIMATION: "animation",
 }
 
 # owner_user_id -> progress
@@ -117,7 +119,16 @@ async def run_initial_index(
     skip: int,
     status_message,
     source_username: Optional[str] = None,
+    user_client: Optional[Client] = None,
+    index_account_id: Optional[str] = None,
 ) -> None:
+    """
+    Bulk index.
+
+    Prefer user_client (userbot) + search_messages for complete history
+    (same approach as classic Wroxen). Falls back to bot sequential
+    get_messages when no user_client is supplied.
+    """
     lock = _lock(owner_user_id)
     if lock.locked():
         try:
@@ -132,6 +143,7 @@ async def run_initial_index(
         range_start = max(skip, 0)
         end_id = int(last_msg_id)
         total_est = max(0, end_id - range_start)
+        mode = "userbot" if user_client is not None else "bot"
         PROGRESS[owner_user_id] = {
             "status": "running",
             "processed": 0,
@@ -146,22 +158,28 @@ async def run_initial_index(
             "range_start": range_start,
             "total_est": total_est,
             "pct": 0,
+            "mode": mode,
+            "index_account_id": index_account_id,
             "status_chat_id": getattr(getattr(status_message, "chat", None), "id", None),
             "status_message_id": getattr(status_message, "id", None),
         }
-        current = range_start
-        BATCH = 80
         last_ui = 0.0
 
         async def _maybe_ui(force: bool = False):
-            """Only update Telegram on force=True (final / explicit). No periodic edits."""
             nonlocal last_ui
             now = time.time()
             p = PROGRESS.get(owner_user_id) or {}
             p["elapsed"] = now - start
-            done = max(0, current - range_start)
-            p["pct"] = int(min(99, round(100.0 * done / total_est))) if total_est else 0
-            p["current_id"] = current
+            if mode == "bot":
+                done = max(0, int(p.get("current_id") or range_start) - range_start)
+                p["pct"] = int(min(99, round(100.0 * done / total_est))) if total_est else 0
+            else:
+                # userbot: estimate from processed vs estimated media-ish volume
+                processed = int(p.get("processed") or 0)
+                if total_est > 0:
+                    p["pct"] = int(min(99, round(100.0 * processed / max(total_est, 1))))
+                else:
+                    p["pct"] = min(99, int(p.get("pct") or 0))
             if not force:
                 return
             last_ui = now
@@ -179,7 +197,7 @@ async def run_initial_index(
                     pass
 
         try:
-            if current >= end_id:
+            if end_id <= 0 or range_start >= end_id:
                 PROGRESS[owner_user_id]["status"] = "done"
                 PROGRESS[owner_user_id]["pct"] = 100
                 await _maybe_ui(True)
@@ -190,69 +208,37 @@ async def run_initial_index(
                 return
 
             await _maybe_ui(force=True)
-            while current < end_id:
-                if CANCEL.get(owner_user_id):
-                    PROGRESS[owner_user_id]["status"] = "cancelled"
-                    await _maybe_ui(True)
-                    break
 
-                batch_end = min(current + BATCH, end_id)
-                ids = list(range(current + 1, batch_end + 1))
-                if not ids:
-                    break
-                try:
-                    messages = await bot_client.get_messages(source_chat_id, ids)
-                except FloodWait as e:
-                    await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
-                    continue
-                except RPCError:
-                    PROGRESS[owner_user_id]["errors"] += len(ids)
-                    current = batch_end
-                    await _maybe_ui(False)
-                    continue
-                except Exception:
-                    logger.exception("wroxen get_messages")
-                    PROGRESS[owner_user_id]["errors"] += len(ids)
-                    current = batch_end
-                    await _maybe_ui(False)
-                    continue
-
-                if not isinstance(messages, list):
-                    messages = [messages]
-
-                for msg in messages:
-                    if CANCEL.get(owner_user_id):
-                        break
-                    PROGRESS[owner_user_id]["processed"] += 1
-                    if msg is None or getattr(msg, "empty", False):
-                        PROGRESS[owner_user_id]["skipped"] += 1
-                        continue
-                    try:
-                        result = await index_message_to_db(
-                            owner_user_id, wroxen_id, source_chat_id, msg, source_username
-                        )
-                        if result == "saved":
-                            PROGRESS[owner_user_id]["indexed"] += 1
-                        elif result == "duplicate":
-                            PROGRESS[owner_user_id]["duplicates"] += 1
-                        elif result == "skip":
-                            PROGRESS[owner_user_id]["skipped"] += 1
-                        else:
-                            PROGRESS[owner_user_id]["errors"] += 1
-                    except Exception:
-                        PROGRESS[owner_user_id]["errors"] += 1
-
-                current = batch_end
-                PROGRESS[owner_user_id]["current_id"] = current
-                await _maybe_ui(False)
-                await asyncio.sleep(0.05)
+            if user_client is not None:
+                await _run_userbot_index(
+                    owner_user_id=owner_user_id,
+                    user_client=user_client,
+                    wroxen_id=wroxen_id,
+                    source_chat_id=source_chat_id,
+                    range_start=range_start,
+                    end_id=end_id,
+                    source_username=source_username,
+                    maybe_ui=_maybe_ui,
+                    start=start,
+                )
+            else:
+                await _run_bot_index(
+                    owner_user_id=owner_user_id,
+                    bot_client=bot_client,
+                    wroxen_id=wroxen_id,
+                    source_chat_id=source_chat_id,
+                    range_start=range_start,
+                    end_id=end_id,
+                    source_username=source_username,
+                    maybe_ui=_maybe_ui,
+                    start=start,
+                )
 
             p = PROGRESS[owner_user_id]
             if p.get("status") == "running":
                 p["status"] = "done"
                 p["pct"] = 100
             p["elapsed"] = time.time() - start
-            p["current_id"] = current
             await _maybe_ui(force=True)
         except Exception as e:
             logger.exception("wroxen initial index failed")
@@ -280,6 +266,150 @@ async def run_initial_index(
             CANCEL.pop(owner_user_id, None)
 
 
+async def _run_userbot_index(
+    *,
+    owner_user_id: int,
+    user_client: Client,
+    wroxen_id: str,
+    source_chat_id: int,
+    range_start: int,
+    end_id: int,
+    source_username: Optional[str],
+    maybe_ui,
+    start: float,
+) -> None:
+    """Index via userbot search_messages — same strategy as classic Wroxen."""
+    BATCH_UI = 50
+    processed_since_ui = 0
+
+    try:
+        async for msg in user_client.search_messages(
+            source_chat_id,
+            filter=MessagesFilter.EMPTY,
+        ):
+            if CANCEL.get(owner_user_id):
+                PROGRESS[owner_user_id]["status"] = "cancelled"
+                await maybe_ui(True)
+                break
+
+            mid = getattr(msg, "id", 0) or 0
+            if mid < range_start or mid > end_id:
+                # search_messages is roughly newest-first; once we go below range_start we can stop
+                if mid < range_start:
+                    # keep scanning a bit in case order is mixed, but break if far past
+                    if mid > 0 and mid < max(0, range_start - 5000):
+                        break
+                continue
+
+            PROGRESS[owner_user_id]["processed"] += 1
+            PROGRESS[owner_user_id]["current_id"] = mid
+            processed_since_ui += 1
+
+            if msg is None or getattr(msg, "empty", False):
+                PROGRESS[owner_user_id]["skipped"] += 1
+                continue
+
+            try:
+                result = await index_message_to_db(
+                    owner_user_id, wroxen_id, source_chat_id, msg, source_username
+                )
+                if result == "saved":
+                    PROGRESS[owner_user_id]["indexed"] += 1
+                elif result == "duplicate":
+                    PROGRESS[owner_user_id]["duplicates"] += 1
+                elif result == "skip":
+                    PROGRESS[owner_user_id]["skipped"] += 1
+                else:
+                    PROGRESS[owner_user_id]["errors"] += 1
+            except Exception:
+                PROGRESS[owner_user_id]["errors"] += 1
+
+            if processed_since_ui >= BATCH_UI:
+                processed_since_ui = 0
+                await maybe_ui(False)
+                await asyncio.sleep(0.05)
+
+    except FloodWait as e:
+        await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
+    except Exception:
+        logger.exception("wroxen userbot search_messages failed")
+        raise
+
+
+async def _run_bot_index(
+    *,
+    owner_user_id: int,
+    bot_client: Client,
+    wroxen_id: str,
+    source_chat_id: int,
+    range_start: int,
+    end_id: int,
+    source_username: Optional[str],
+    maybe_ui,
+    start: float,
+) -> None:
+    """Fallback: sequential get_messages with bot client."""
+    current = range_start
+    BATCH = 80
+
+    while current < end_id:
+        if CANCEL.get(owner_user_id):
+            PROGRESS[owner_user_id]["status"] = "cancelled"
+            await maybe_ui(True)
+            break
+
+        batch_end = min(current + BATCH, end_id)
+        ids = list(range(current + 1, batch_end + 1))
+        if not ids:
+            break
+        try:
+            messages = await bot_client.get_messages(source_chat_id, ids)
+        except FloodWait as e:
+            await asyncio.sleep(int(getattr(e, "value", 5)) + 1)
+            continue
+        except RPCError:
+            PROGRESS[owner_user_id]["errors"] += len(ids)
+            current = batch_end
+            await maybe_ui(False)
+            continue
+        except Exception:
+            logger.exception("wroxen get_messages")
+            PROGRESS[owner_user_id]["errors"] += len(ids)
+            current = batch_end
+            await maybe_ui(False)
+            continue
+
+        if not isinstance(messages, list):
+            messages = [messages]
+
+        for msg in messages:
+            if CANCEL.get(owner_user_id):
+                break
+            PROGRESS[owner_user_id]["processed"] += 1
+            if msg is None or getattr(msg, "empty", False):
+                PROGRESS[owner_user_id]["skipped"] += 1
+                continue
+            try:
+                result = await index_message_to_db(
+                    owner_user_id, wroxen_id, source_chat_id, msg, source_username
+                )
+                if result == "saved":
+                    PROGRESS[owner_user_id]["indexed"] += 1
+                elif result == "duplicate":
+                    PROGRESS[owner_user_id]["duplicates"] += 1
+                elif result == "skip":
+                    PROGRESS[owner_user_id]["skipped"] += 1
+                else:
+                    PROGRESS[owner_user_id]["errors"] += 1
+            except Exception:
+                PROGRESS[owner_user_id]["errors"] += 1
+
+        current = batch_end
+        PROGRESS[owner_user_id]["current_id"] = current
+        await maybe_ui(False)
+        await asyncio.sleep(0.05)
+
+
 def _bar(pct: int) -> str:
     pct = max(0, min(100, int(pct or 0)))
     filled = pct // 10
@@ -299,13 +429,16 @@ def _fmt(p: Dict[str, Any]) -> str:
     cur = int(p.get("current_id") or 0)
     end = int(p.get("end_id") or 0)
     start_id = int(p.get("range_start") or 0)
+    mode = p.get("mode") or "bot"
+    mode_line = "Mode: **Userbot** (full history)" if mode == "userbot" else "Mode: **Bot** (sequential)"
     speed = 0.0
     if elapsed > 1:
         speed = float(p.get("processed") or 0) / elapsed
     return (
         f"**{title}**\n\n"
         f"`{_bar(pct)}` **{pct}%**\n"
-        f"Cursor: `#{cur:,}` / `#{end:,}` (from `#{start_id:,}`)\n\n"
+        f"Cursor: `#{cur:,}` / `#{end:,}` (from `#{start_id:,}`)\n"
+        f"{mode_line}\n\n"
         f"Processed: **{p.get('processed', 0):,}**\n"
         f"Indexed: **{p.get('indexed', 0):,}**\n"
         f"Duplicates: **{p.get('duplicates', 0):,}**\n"
@@ -331,6 +464,10 @@ def format_live(uid: int) -> Optional[str]:
         total_est = max(0, end_id - range_start) or int(p.get("total_est") or 0)
         if (p.get("status") or "") == "done":
             p["pct"] = 100
+        elif p.get("mode") == "userbot":
+            processed = int(p.get("processed") or 0)
+            if total_est > 0:
+                p["pct"] = int(min(99, round(100.0 * processed / max(total_est, 1))))
         elif total_est > 0:
             done = max(0, current - range_start)
             p["pct"] = int(min(99, round(100.0 * done / total_est)))
