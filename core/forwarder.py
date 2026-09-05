@@ -321,7 +321,7 @@ async def forward_messages(
     # Keep QF control buttons on progress edits when auto_progress is off
     progress_kb = None if auto_progress else _qf_progress_keyboard()
     # Throttle expensive Mongo reads/writes (old clone.py had none per-skip)
-    JOB_DB_EVERY = 100  # messages between job status/stats DB hits
+    JOB_DB_EVERY = 25  # messages between job status/stats DB hits
     _since_db = 0
     _pending_stats = {"fetched": 0, "forwarded": 0, "errors": 0,
                      "skipped_filter": 0, "skipped_deleted": 0, "skipped_duplicate": 0}

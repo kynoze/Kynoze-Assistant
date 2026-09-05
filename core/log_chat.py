@@ -139,7 +139,9 @@ async def get_owner_log_chat() -> Optional[dict]:
             _owner_log_cache = info
             return info
     except Exception as e:
-        logger.warning("get_owner_log_chat DB failed: %s", type(e).__name__)
+        # Rate-limit: only log first failure every 5 min
+        if _should_rate("get_owner_log_chat_fail", 300.0):
+            logger.warning("get_owner_log_chat DB failed: %s", type(e).__name__)
     if _owner_log_cache and _owner_log_cache.get("chat_id"):
         return _owner_log_cache
     try:
@@ -334,6 +336,15 @@ class OwnerLogHandler(logging.Handler):
             raw = record.getMessage()
         except Exception:
             raw = ""
+        # Don't spam owner chat with Mongo Atlas network timeouts
+        low = (raw or "").lower()
+        if (
+            "serverselectiontimeout" in low
+            or "serverselectiontimeouterror" in (record.exc_info[0].__name__.lower() if record.exc_info and record.exc_info[0] else "")
+            or "mongodb unreachable" in low
+            or "get_owner_log_chat db failed" in low
+        ):
+            return
         try:
             msg = self.format(record)
         except Exception:

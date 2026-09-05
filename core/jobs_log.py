@@ -250,5 +250,15 @@ async def jobs_log_refresh_loop(app: Client):
                     logger.exception("jobs_log refresh one job")
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as e:
+            from core.errors import is_mongo_unreachable
+            if is_mongo_unreachable(e):
+                logger.warning("jobs_log: MongoDB unreachable — reconnect + backoff")
+                try:
+                    from database import db
+                    await db.reconnect()
+                except Exception:
+                    pass
+                await asyncio.sleep(30)
+                continue
             logger.exception("jobs_log_refresh_loop")

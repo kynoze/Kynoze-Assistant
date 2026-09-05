@@ -280,7 +280,12 @@ async def progress_ui_refresh_loop(app: Client):
                     logger.exception("progress_ui refresh one job")
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as e:
+            from core.errors import is_mongo_unreachable
+            if is_mongo_unreachable(e):
+                logger.warning("progress_ui: MongoDB unreachable — backoff 90s")
+                await asyncio.sleep(90)
+                continue
             logger.exception("progress_ui_refresh_loop")
 
 async def job_worker_loop(_management_client=None):
@@ -317,7 +322,20 @@ async def job_worker_loop(_management_client=None):
                 if task and not task.done():
                     continue
                 RUNNING_JOB_TASKS[job_id] = asyncio.create_task(run_single_job(job))
-        except Exception:
+        except Exception as e:
+            from core.errors import is_mongo_unreachable
+            if is_mongo_unreachable(e):
+                logger.warning(
+                    "Job worker: MongoDB unreachable — reconnect + backoff (%s)",
+                    type(e).__name__,
+                )
+                try:
+                    from database import db
+                    await db.reconnect()
+                except Exception:
+                    pass
+                await asyncio.sleep(30)
+                continue
             logger.exception("Job worker poll failed")
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 

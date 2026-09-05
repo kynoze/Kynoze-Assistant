@@ -161,7 +161,7 @@ async def test_uri(uri: str, timeout_ms: int = 8000) -> Tuple[bool, str]:
         pass
     client = None
     try:
-        client = AsyncMongoClient(uri, serverSelectionTimeoutMS=timeout_ms)
+        client = AsyncMongoClient(uri, serverSelectionTimeoutMS=timeout_ms, maxPoolSize=5, minPoolSize=0)
         await client.admin.command("ping")
         name = db_name_from_uri(uri)
         dbh = client[name]
@@ -191,14 +191,19 @@ async def get_cached_client(uri: str) -> AsyncMongoClient:
             apply_termux_dns_fix()
         except Exception:
             pass
-        client = AsyncMongoClient(
-            uri,
-            serverSelectionTimeoutMS=20000,
-            connectTimeoutMS=20000,
-            socketTimeoutMS=45000,
-            retryWrites=True,
-            retryReads=True,
-        )
+        try:
+            from database import MONGO_CLIENT_KW
+            kw = dict(MONGO_CLIENT_KW)
+        except Exception:
+            kw = dict(
+                serverSelectionTimeoutMS=20000,
+                connectTimeoutMS=20000,
+                socketTimeoutMS=45000,
+                maxPoolSize=25,
+                minPoolSize=0,
+                maxIdleTimeMS=45000,
+            )
+        client = AsyncMongoClient(uri, **kw)
         _clients[key] = client
         return client
 
