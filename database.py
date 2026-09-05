@@ -79,7 +79,11 @@ class Database:
 
             self.client = AsyncMongoClient(
                 Config.MONGO_URI,
-                serverSelectionTimeoutMS=5000
+                serverSelectionTimeoutMS=20000,
+                connectTimeoutMS=20000,
+                socketTimeoutMS=45000,
+                retryWrites=True,
+                retryReads=True,
             )
             await self.client.admin.command("ping")
 
@@ -870,6 +874,16 @@ async def get_user_bots(user_id: int) -> List[Dict[str, Any]]:
 
 
 async def get_bot(user_id: int, bot_id: str) -> Optional[Dict[str, Any]]:
+    if bot_id == "__mgmt__":
+        return {
+            "bot_id": "__mgmt__",
+            "name": "Management Bot",
+            "bot_username": None,
+            "status": "active",
+            "is_mgmt": True,
+            "bot_token": None,
+            "user_id": user_id,
+        }
     return await db.forward_bots.find_one({
         "user_id": user_id,
         "bot_id": bot_id
@@ -1785,6 +1799,7 @@ async def create_wroxen_config(
     target_chat_id: int,
     target_title: str,
     name: Optional[str] = None,
+    index_account_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     await ensure_wroxen_indexes()
     existing = await db.db["wroxen_configs"].find_one({
@@ -1807,6 +1822,7 @@ async def create_wroxen_config(
         "target_title": target_title,
         "enabled": True,
         "auto_index": True,
+        "index_account_id": index_account_id,  # userbot for full-history index (optional)
         "created_at": now,
         "updated_at": now,
         "last_index_at": None,

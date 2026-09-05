@@ -25,6 +25,8 @@ class Config:
     ADMINS = _int_list(os.environ.get("ADMINS", ""))
     # Bot owner(s). If empty, first ADMIN is treated as owner.
     OWNER_IDS = _int_list(os.environ.get("OWNER_IDS", "") or os.environ.get("OWNER_ID", ""))
+    # Optional fallback when DB is down (Telegram chat id)
+    OWNER_LOG_CHAT_ID = int(os.environ.get("OWNER_LOG_CHAT_ID", "0") or 0) or None
     # Encrypt session strings / bot tokens at rest. Prefer SESSION_ENC_KEY.
     SESSION_ENC_KEY = (
         os.environ.get("SESSION_ENC_KEY", "")
