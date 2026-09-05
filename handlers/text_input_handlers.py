@@ -59,6 +59,21 @@ def _unwrap_job(state):
 
 @Client.on_message(filters.private & filters.text & ~filters.command(["start", "targets", "cancel"]))
 async def handle_all_text_input(client: Client, message: Message):
+    # Bind DB helpers at function entry so no UnboundLocalError from nested imports
+    from database import (
+        get_user_bots,
+        get_user_accounts,
+        get_user_targets,
+        get_target,
+        get_account,
+        get_job,
+        update_job,
+        add_target,
+        add_forward_bot,
+        add_forward_account,
+        update_account,
+        update_target_settings,
+    )
     from handlers.logchat_handlers import handle_log_chat_text
     if await handle_log_chat_text(client, message):
         return
@@ -558,7 +573,6 @@ async def handle_all_text_input(client: Client, message: Message):
                 )
 
             from core.access import check_limit
-            from database import get_user_targets, get_user_bots, get_user_accounts
 
             err = await check_limit(
                 user_id, "targets", len(await get_user_targets(user_id))

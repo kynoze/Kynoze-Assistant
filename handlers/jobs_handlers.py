@@ -1524,22 +1524,28 @@ async def jobs_callbacks(client: Client, query: CallbackQuery):
                 if not bot or bot.get("status") != "active":
                     await query.message.reply("Bot not available or disabled.")
                     return
-                token = bot["bot_token"]
-                try:
-                    from handlers.ui import load_secret
-                    token = load_secret(token)
-                except Exception:
-                    await query.message.reply("❌ Could not read stored bot token. Check SESSION_ENC_KEY.")
-                    return
-                check_client = TempClient(
-                    name=f"perm_check_{job_id}",
-                    api_id=Config.API_ID,
-                    api_hash=Config.API_HASH,
-                    bot_token=token,
-                    in_memory=True,
-                    no_updates=True,
-                )
-                await check_client.start()
+                if bot.get("bot_id") == "__mgmt__" or bot.get("is_mgmt"):
+                    # Use management bot (already running) for permission check
+                    check_client = client
+                else:
+                    token = bot.get("bot_token")
+                    try:
+                        from handlers.ui import load_secret
+                        token = load_secret(token)
+                    except Exception:
+                        await query.message.reply(
+                            "❌ Could not read stored bot token. Check SESSION_ENC_KEY."
+                        )
+                        return
+                    check_client = TempClient(
+                        name=f"perm_check_{job_id}",
+                        api_id=Config.API_ID,
+                        api_hash=Config.API_HASH,
+                        bot_token=token,
+                        in_memory=True,
+                        no_updates=True,
+                    )
+                    await check_client.start()
             elif method == "user":
                 account = await get_next_available_account(user_id, job.get("account_ids", []))
                 if not account:

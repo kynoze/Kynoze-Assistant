@@ -97,29 +97,37 @@ def parse_source_from_message(
 async def continue_job_create_from_source(
     client: Client, message: Message, user_id: int, source_chat_id, last_msg_id: int
 ):
-    """Source resolved → method → executors → perm check → targets."""
-    from core.chat_resolve import resolve_source_chat_id
+    """Store source from link/forward — NO access check yet.
+
+    Permission check runs only after user picks Bot / Account(s).
+    """
     from handlers.keyboards import select_method_keyboard
 
-    source_chat, err = await resolve_source_chat_id(client, user_id, source_chat_id)
-    if not source_chat:
-        msg = (
-            "Cannot access source chat.\n\n"
-            + str(err)
-            + "\n\nManagement Bot does not need access.\n"
-            "Join the source with a linked My Account, then send the link again\n"
-            "or forward a message from the source."
-        )
-        return await message.reply(msg, parse_mode=None)
+    source_title = "Source"
+    origin = None
+    try:
+        if getattr(message, "forward_from_chat", None):
+            origin = message.forward_from_chat
+        elif getattr(message, "forward_origin", None):
+            origin = getattr(message.forward_origin, "chat", None)
+    except Exception:
+        origin = None
+    if origin is not None:
+        source_title = getattr(origin, "title", None) or source_title
+        if getattr(origin, "id", None):
+            source_chat_id = origin.id
 
-    if source_chat.type not in [ChatType.CHANNEL, ChatType.GROUP, ChatType.SUPERGROUP]:
-        return await message.reply("Source must be a Channel or Group.")
+    try:
+        if isinstance(source_chat_id, str) and source_chat_id.lstrip("-").isdigit():
+            source_chat_id = int(source_chat_id)
+    except Exception:
+        pass
 
     set_state(client, "job_create_state", user_id, {
         "step": "method",
-        "source_chat_id": source_chat.id,
-        "source_title": source_chat.title or "Unknown",
-        "last_msg_id": last_msg_id,
+        "source_chat_id": source_chat_id,
+        "source_title": source_title,
+        "last_msg_id": int(last_msg_id or 0),
         "selected_targets": [],
         "selected_accounts": [],
         "future_new_posts": False,
@@ -127,14 +135,17 @@ async def continue_job_create_from_source(
         "skip": 0,
     })
 
-    await message.reply(
-        f"**Source:** {source_chat.title}\n"
-        f"**ID:** `{source_chat.id}`\n"
-        f"**Last Message ID:** `{last_msg_id}`\n\n"
-        f"**Create Job – Choose method**\n"
-        f"Next: pick bot/accounts (only those are permission-checked).",
-        reply_markup=select_method_keyboard(),
+    nl = "\n"
+    text = (
+        "**Source saved** (access not checked yet)" + nl
+        + f"**Title:** {source_title}" + nl
+        + f"**ID:** `{source_chat_id}`" + nl
+        + f"**Last Message ID:** `{last_msg_id}`" + nl + nl
+        + "**Create Job – Choose method**" + nl
+        + "Next: select **Forward Bot** or **User Account(s)**." + nl
+        + "Only the selected executor will be used to access source/targets."
     )
+    await message.reply(text, reply_markup=select_method_keyboard())
 
 
 @Client.on_message(

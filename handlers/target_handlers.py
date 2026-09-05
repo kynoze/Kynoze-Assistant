@@ -44,6 +44,11 @@ def _executor_pick_keyboard(bots, accounts, selected_bots, selected_accs):
     from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     from handlers.ui import format_account_label, format_bot_label, active_accounts_only
     rows = []
+    mark_m = "✅" if "__mgmt__" in (selected_bots or []) else "⬜"
+    rows.append([InlineKeyboardButton(
+        f"{mark_m} 🛡 Management Bot",
+        callback_data="tg:exec:tog:bot:__mgmt__",
+    )])
     for b in _active_bots_only(bots)[:20]:
         bid = str(b.get("bot_id") or "")
         mark = "✅" if bid in selected_bots else "⬜"

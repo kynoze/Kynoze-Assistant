@@ -535,7 +535,14 @@ def select_bot_keyboard(bots: List[Dict]) -> InlineKeyboardMarkup:
     from handlers.ui import format_bot_label
 
     buttons = []
-    for b in bots:
+    # Management bot can also forward to targets (no separate token needed)
+    buttons.append([
+        InlineKeyboardButton(
+            "🛡 Management Bot",
+            callback_data="jobcreate:select_bot:__mgmt__",
+        )
+    ])
+    for b in bots or []:
         name = format_bot_label(b, short=True)[:40]
         buttons.append([
             InlineKeyboardButton(
