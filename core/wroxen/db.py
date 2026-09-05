@@ -93,6 +93,9 @@ async def test_uri(uri: str, timeout_ms: int = 8000) -> Tuple[bool, str]:
     try:
         client = AsyncMongoClient(
             uri,
+            maxPoolSize=15,
+            minPoolSize=0,
+            maxIdleTimeMS=45000,
             serverSelectionTimeoutMS=timeout_ms,
             connectTimeoutMS=timeout_ms,
         )
