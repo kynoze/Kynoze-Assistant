@@ -36,7 +36,12 @@ async def delete_monitor_loop(_management_client=None):
                 logger.info("Auto-delete due for %s (%s)", cid, cfg.get("target_title"))
                 task = asyncio.create_task(_run_auto(cfg))
                 RUNNING[cid] = task
-        except Exception:
+        except Exception as e:
+            from core.errors import is_mongo_unreachable
+            if is_mongo_unreachable(e):
+                logger.warning("Delete monitor: MongoDB unreachable — backoff 90s")
+                await asyncio.sleep(90)
+                continue
             logger.exception("Delete monitor poll failed")
         await asyncio.sleep(POLL_SECONDS)
 
