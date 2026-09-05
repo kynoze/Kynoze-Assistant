@@ -18,6 +18,21 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 
+# Atlas M0 / shared: keep pools small so concurrent clients don't exhaust cluster limit (~500).
+MONGO_CLIENT_KW = dict(
+    serverSelectionTimeoutMS=20000,
+    connectTimeoutMS=20000,
+    socketTimeoutMS=45000,
+    retryWrites=True,
+    retryReads=True,
+    maxPoolSize=25,
+    minPoolSize=0,
+    maxIdleTimeMS=45000,
+    waitQueueTimeoutMS=15000,
+    heartbeatFrequencyMS=10000,
+)
+
+
 # ============================================================
 # ENUMS / CONSTANTS
 # ============================================================
@@ -79,11 +94,7 @@ class Database:
 
             self.client = AsyncMongoClient(
                 Config.MONGO_URI,
-                serverSelectionTimeoutMS=20000,
-                connectTimeoutMS=20000,
-                socketTimeoutMS=45000,
-                retryWrites=True,
-                retryReads=True,
+                **MONGO_CLIENT_KW,
             )
             await self.client.admin.command("ping")
 
@@ -110,8 +121,55 @@ class Database:
 
         except Exception as e:
             logger.error(f"❌ MongoDB connection failed: {e}")
+            logger.error(
+                "MongoDB unreachable. Check: (1) Atlas Network Access allows 0.0.0.0/0 "
+                "or this host IP (2) MONGO_URI correct (3) cluster not paused "
+                "(4) outbound TCP 27017 not blocked on Heroku/network."
+            )
             raise
-          
+
+
+    async def close(self) -> None:
+        """Close client (best-effort)."""
+        client = self.client
+        self.client = None
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+    async def reconnect(self) -> bool:
+        """Drop stale client and open a fresh pool. Returns True on success.
+
+        Restart "fixes" Atlas because it closes all connections; this does the
+        same without a full process restart (important on free 512MB shared).
+        """
+        logger.warning("MongoDB reconnect: closing stale client and reopening…")
+        try:
+            await self.close()
+        except Exception:
+            pass
+        try:
+            await self.connect()
+            return True
+        except Exception as e:
+            logger.error("MongoDB reconnect failed: %s", e)
+            return False
+
+    async def ensure_connected(self) -> bool:
+        """Ping; on failure reconnect once."""
+        try:
+            if self.client is None:
+                await self.connect()
+                return True
+            await self.client.admin.command("ping")
+            return True
+        except Exception as e:
+            logger.warning("MongoDB ping failed (%s) — reconnecting", type(e).__name__)
+            return await self.reconnect()
+
+
     async def _create_indexes(self) -> None:
         # users
         await self.users.create_index([("user_id", ASCENDING)], unique=True)
@@ -211,6 +269,29 @@ class Database:
 
 # Global instance
 db = Database()
+
+async def mongo_health_loop(interval: int = 60) -> None:
+    """Periodically ping Mongo; auto-reconnect if the free-tier pool goes stale."""
+    import asyncio
+    from core.errors import is_mongo_unreachable
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            ok = await db.ensure_connected()
+            if not ok:
+                logger.warning("mongo_health_loop: still down after reconnect attempt")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if is_mongo_unreachable(e):
+                logger.warning("mongo_health_loop: unreachable — try reconnect")
+                try:
+                    await db.reconnect()
+                except Exception:
+                    pass
+            else:
+                logger.exception("mongo_health_loop")
+
 
 
 # ============================================================

@@ -75,6 +75,8 @@ async def main():
             )
     except Exception:
         logger.exception("log-chat init failed")
+    from database import mongo_health_loop
+    asyncio.create_task(mongo_health_loop(60))
     asyncio.create_task(job_worker_loop(app))
     try:
         from core.job_worker import progress_ui_refresh_loop
