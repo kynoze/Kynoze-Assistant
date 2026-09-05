@@ -128,6 +128,7 @@ async def get_owner_log_chat() -> Optional[dict]:
     """Owner log chat from DB; falls back to memory cache / env if Mongo is down."""
     global _owner_log_cache
     try:
+        from core.access import get_system_settings
         s = await get_system_settings()
         cid = s.get("owner_log_chat_id")
         if cid:
