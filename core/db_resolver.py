@@ -191,7 +191,14 @@ async def get_cached_client(uri: str) -> AsyncMongoClient:
             apply_termux_dns_fix()
         except Exception:
             pass
-        client = AsyncMongoClient(uri, serverSelectionTimeoutMS=8000)
+        client = AsyncMongoClient(
+            uri,
+            serverSelectionTimeoutMS=20000,
+            connectTimeoutMS=20000,
+            socketTimeoutMS=45000,
+            retryWrites=True,
+            retryReads=True,
+        )
         _clients[key] = client
         return client
 

@@ -324,6 +324,17 @@ async def job_worker_loop(_management_client=None):
 
 async def get_bot_client(bot_doc: dict) -> Optional[Client]:
     bot_id = bot_doc["bot_id"]
+    # Management bot = main app client
+    if bot_id == "__mgmt__" or bot_doc.get("is_mgmt"):
+        try:
+            from core.log_chat import get_mgmt_bot
+            c = get_mgmt_bot()
+            if c:
+                return c
+        except Exception:
+            pass
+        return None
+
     cached = CLIENTS.get(f"bot:{bot_id}")
     if cached:
         return cached
