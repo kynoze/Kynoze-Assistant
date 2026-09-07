@@ -2,6 +2,7 @@ from pyrogram import Client, filters
 from pyrogram.types import CallbackQuery
 
 from database import (
+    clear_duplicates,
     DEFAULT_TARGET_SETTINGS,
     get_setting,
     get_target,
@@ -140,7 +141,7 @@ def _config_text(target: dict) -> str:
         f"**Media Types:**\n{media_lines}\n\n"
         f"Forward Tag: {_mark(s.get('forward_tag'))}\n"
         f"Delay: `{s.get('delay', 1.0)}s`\n"
-        f"Anti-Duplicate: {_mark(s.get('anti_duplicate', True))}\n"
+        f"Anti-Duplicate: {_mark(s.get('anti_duplicate', False))}\n"
         f"Future New Posts: {_mark(s.get('future_new_posts'))}"
     )
 
@@ -246,7 +247,7 @@ async def settings_callbacks(client: Client, query: CallbackQuery):
         default_on = {
             "block_words_enabled": True,
             "inline_buttons_enabled": True,
-            "anti_duplicate": True,
+            "anti_duplicate": False,
         }.get(key, False)
         current = bool(get_setting(target, key, default_on))
         await update_target_settings(user_id, chat_id, {key: not current})
@@ -264,7 +265,17 @@ async def settings_callbacks(client: Client, query: CallbackQuery):
         await safe_edit(query, _config_text(target), view_config_keyboard(chat_id))
         return await safe_answer(query)
 
+    if action == "cleardup":
+        chat_id = int(parts[2])
+        n = await clear_duplicates(user_id, chat_id)
+        return await safe_answer(
+            query,
+            f"Cleared {n} anti-duplicate record(s) for this target.",
+            True,
+        )
+
     if action == "reset":
+
         chat_id = int(parts[2])
         await safe_edit(
             query,
@@ -286,15 +297,15 @@ async def settings_callbacks(client: Client, query: CallbackQuery):
             s["caption_template"] = DEFAULT_TARGET_SETTINGS["caption_template"]
         elif group == "filters":
             s["block_words"] = []
-            s["block_words_enabled"] = True
+            s["block_words_enabled"] = False
             s["whitelist"] = []
             s["whitelist_mode"] = False
             s["remove_links"] = False
             s["media_types"] = list(DEFAULT_TARGET_SETTINGS["media_types"])
-            s["anti_duplicate"] = True
+            s["anti_duplicate"] = False
         elif group == "buttons":
             s["inline_buttons"] = []
-            s["inline_buttons_enabled"] = True
+            s["inline_buttons_enabled"] = False
         elif group == "replacements":
             s["replacements"] = []
             s["replace_enabled"] = False

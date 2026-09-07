@@ -110,7 +110,7 @@ def _target_detail_text(target: dict, user_id: int) -> str:
         f"🔗 Remove links: {on_off(bool(s.get('remove_links')))}\n"
         f"🔘 Inline buttons: `{len(buttons)}` rows\n"
         f"⏱ Delay: `{s.get('delay', 1.0)}s`\n"
-        f"♻️ Anti-duplicate: {on_off(bool(s.get('anti_duplicate', True)))}\n"
+        f"♻️ Anti-duplicate: {on_off(bool(s.get('anti_duplicate', False)))}\n"
         f"🏷 Forward tag: {on_off(bool(s.get('forward_tag')))}\n"
         f"🆕 Future posts: {on_off(bool(s.get('future_new_posts')))}"
     )

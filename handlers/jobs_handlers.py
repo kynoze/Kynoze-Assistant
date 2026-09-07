@@ -10,6 +10,8 @@ from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMa
 
 from config import Config
 from database import (
+    next_job_name_for_source,
+    rename_job,
     JobStatus,
     add_job_log,
     clear_job_logs,
@@ -245,7 +247,8 @@ def job_controls_keyboard(job: dict) -> InlineKeyboardMarkup:
     )
     buttons.append(
         [
-            InlineKeyboardButton("🗑 Delete", callback_data=f"job:delete:{job_id}"),
+            InlineKeyboardButton("✏️ Rename", callback_data=f"job:rename:{job_id}"),
+                InlineKeyboardButton("🗑 Delete", callback_data=f"job:delete:{job_id}"),
             InlineKeyboardButton("« Back", callback_data="job:list"),
         ]
     )
@@ -763,6 +766,12 @@ def job_confirm_keyboard(state: dict) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    f"✏️ Name: {(state.get('custom_name') or (state.get('source_title') or 'auto') + ' (auto)')[:32]}",
+                    callback_data="jobcreate:set_name",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     f"Create Job  ({method}, {n_targets} target)",
                     callback_data="jobcreate:confirm",
                 )
@@ -809,17 +818,23 @@ def _is_preindexing(job: dict) -> bool:
 def _preindex_progress_line(job: dict) -> str:
     if not job.get("pre_index_target_duplicates"):
         return "🔍 Pre-Index: `OFF`\n"
-    st = job.get("pre_index_status") or "—"
+    st = (job.get("pre_index_status") or "—").lower()
     n = int(job.get("pre_index_count") or 0)
     if st == "running" or (job.get("status") or "") == "indexing":
         pct = int(job.get("pre_index_progress_pct") or 0)
         return f"🔍 Pre-Index: `running` **{pct}%** · ids `{n}`\n"
     if st == "done":
+        seen = int(job.get("pre_index_messages_seen") or 0)
+        if n == 0 and seen:
+            return f"🔍 Pre-Index: `done` · **0** media IDs (scanned {seen} msgs)\n"
+        if n == 0:
+            return f"🔍 Pre-Index: `done` · **0** media IDs (empty/no access?)\n"
         return f"🔍 Pre-Index: `done` · **{n}** media IDs\n"
     if st == "failed":
         err = (job.get("pre_index_error") or job.get("error_message") or "")[:80]
         return f"🔍 Pre-Index: `failed` · {err}\n"
     return f"🔍 Pre-Index: `{st}` · ids `{n}`\n"
+
 
 
 def _preindex_detail_text(job: dict) -> str:
@@ -886,6 +901,7 @@ def job_confirm_text(state: dict) -> str:
     start_at = skip + 1 if last else 0
     return (
         "**Create Job – Confirm**\n\n"
+        f"**Name:** {state.get('custom_name') or ((state.get('source_title') or 'Source') + ' (auto)')}\n"
         f"**Source:** {state.get('source_title')}\n"
         f"**Source ID:** `{state.get('source_chat_id')}`\n"
         f"**Last message ID:** `{last}`  (from source link — not skip)\n"
@@ -1525,8 +1541,11 @@ async def jobs_callbacks(client: Client, query: CallbackQuery):
                     await query.message.reply("Bot not available or disabled.")
                     return
                 if bot.get("bot_id") == "__mgmt__" or bot.get("is_mgmt"):
-                    # Use management bot (already running) for permission check
-                    check_client = client
+                    await query.message.reply(
+                        "❌ Management Bot cannot be used for Jobs.\n"
+                        "Select a Forward Bot from My Bots."
+                    )
+                    return
                 else:
                     token = bot.get("bot_token")
                     try:
@@ -1875,6 +1894,28 @@ async def job_create_callbacks(client: Client, query: CallbackQuery):
         await safe_edit(query, job_confirm_text(state), job_confirm_keyboard(state))
         return await safe_answer(query)
 
+    if action == "set_name":
+        state["step"] = "waiting_name"
+        _persist_create(client, user_id, state)
+        await safe_edit(
+            query,
+            "**✏️ Job name**\n\n"
+            "Send a custom name for this job.\n"
+            "Send `auto` to use automatic naming from the source title.\n\n"
+            f"Source: **{state.get('source_title') or '—'}**\n"
+            "Send /cancel to abort.",
+            InlineKeyboardMarkup(
+                [[InlineKeyboardButton("« Back", callback_data="jobcreate:back_confirm")]]
+            ),
+        )
+        return await safe_answer(query)
+
+    if action == "back_confirm":
+        state["step"] = "confirm"
+        _persist_create(client, user_id, state)
+        await safe_edit(query, job_confirm_text(state), job_confirm_keyboard(state))
+        return await safe_answer(query)
+
     if action == "toggle_preindex":
         state["pre_index_target_duplicates"] = not bool(
             state.get("pre_index_target_duplicates")
@@ -1944,7 +1985,10 @@ async def job_create_callbacks(client: Client, query: CallbackQuery):
                 skip=skip,
                 future_new_posts=bool(state.get("future_new_posts")),
                 pre_index_target_duplicates=bool(state.get("pre_index_target_duplicates")),
-                name=f"Job {(state.get('source_title') or '')[:20]}",
+                name=(
+                    (state.get("custom_name") or "").strip()
+                    or await next_job_name_for_source(user_id, state.get("source_title") or "Source")
+                ),
             )
         except Exception:
             logger.exception("create_job failed")

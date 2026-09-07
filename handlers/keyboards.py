@@ -144,12 +144,12 @@ def settings_category_keyboard(target: Dict[str, Any], category: str) -> InlineK
             [InlineKeyboardButton(f"🔄 Replacement  {on_off('replace_enabled')}", callback_data=f"st:toggle:{chat_id}:replace_enabled")],
             [InlineKeyboardButton("✏️ Manage Replacements", callback_data=f"st:menu:{chat_id}:replacements")],
             [InlineKeyboardButton(f"🔗 Remove Links  {on_off('remove_links')}", callback_data=f"st:toggle:{chat_id}:remove_links")],
-            [InlineKeyboardButton(f"🔘 Inline Buttons  {on_off('inline_buttons_enabled', True)}", callback_data=f"st:toggle:{chat_id}:inline_buttons_enabled")],
+            [InlineKeyboardButton(f"🔘 Inline Buttons  {on_off('inline_buttons_enabled', False)}", callback_data=f"st:toggle:{chat_id}:inline_buttons_enabled")],
             [InlineKeyboardButton("🛠 Manage Inline Buttons", callback_data=f"st:menu:{chat_id}:inline_buttons")],
         ]
     elif category == "filters":
         buttons = [
-            [InlineKeyboardButton(f"🚫 Block Words  {on_off('block_words_enabled', True)}", callback_data=f"st:toggle:{chat_id}:block_words_enabled")],
+            [InlineKeyboardButton(f"🚫 Block Words  {on_off('block_words_enabled', False)}", callback_data=f"st:toggle:{chat_id}:block_words_enabled")],
             [InlineKeyboardButton("🛠 Manage Block List", callback_data=f"st:menu:{chat_id}:block_words")],
             [InlineKeyboardButton(f"✅ Whitelist Mode  {on_off('whitelist_mode')}", callback_data=f"st:toggle:{chat_id}:whitelist_mode")],
             [InlineKeyboardButton("📋 Manage Whitelist", callback_data=f"st:menu:{chat_id}:whitelist")],
@@ -159,7 +159,8 @@ def settings_category_keyboard(target: Dict[str, Any], category: str) -> InlineK
         buttons = [
             [InlineKeyboardButton(f"↪️ Forward Tag  {on_off('forward_tag')}", callback_data=f"st:toggle:{chat_id}:forward_tag")],
             [InlineKeyboardButton(f"⏱ Delay  [{s.get('delay', 1.0)}s]", callback_data=f"st:menu:{chat_id}:delay")],
-            [InlineKeyboardButton(f"🛡 Anti-Duplicate  {on_off('anti_duplicate', True)}", callback_data=f"st:toggle:{chat_id}:anti_duplicate")],
+            [InlineKeyboardButton(f"🛡 Anti-Duplicate  {on_off('anti_duplicate', False)}", callback_data=f"st:toggle:{chat_id}:anti_duplicate")],
+            [InlineKeyboardButton("🗑 Clear Anti-Dupe Data", callback_data=f"st:cleardup:{chat_id}")],
         ]
     else:
         buttons = [
@@ -532,29 +533,32 @@ def select_accounts_keyboard(accounts: List[Dict], selected: List[str]) -> Inlin
 
 
 def select_bot_keyboard(bots: List[Dict]) -> InlineKeyboardMarkup:
+    """Forward bots only — Management Bot cannot be used for Jobs."""
     from handlers.ui import format_bot_label
 
     buttons = []
-    # Management bot can also forward to targets (no separate token needed)
-    buttons.append([
-        InlineKeyboardButton(
-            "🛡 Management Bot",
-            callback_data="jobcreate:select_bot:__mgmt__",
-        )
-    ])
     for b in bots or []:
+        if (b.get("bot_id") == "__mgmt__") or b.get("is_mgmt"):
+            continue
         name = format_bot_label(b, short=True)[:40]
         buttons.append([
             InlineKeyboardButton(
                 f"🤖 {name}",
-                callback_data=f"jobcreate:select_bot:{b['bot_id']}"
+                callback_data=f"jobcreate:select_bot:{b['bot_id']}",
             )
         ])
-
+    if not buttons:
+        buttons.append([
+            InlineKeyboardButton(
+                "No Forward Bots — add one in My Bots",
+                callback_data="bot:list",
+            )
+        ])
     buttons.append([
         InlineKeyboardButton("❌ Cancel", callback_data="job:list")
     ])
     return InlineKeyboardMarkup(buttons)
+
 
 
 def list_manage_keyboard(chat_id: int, feature: str, count: int, page: int = 0) -> InlineKeyboardMarkup:
