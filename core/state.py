@@ -25,6 +25,7 @@ STATE_NAMES = (
     "job_interval_state",
     "jobs_log_channel_state",
     "job_filter_state",
+    "job_rename_state",
     "qf_filter_state",
     "job_acc_state",
 )

@@ -29,10 +29,22 @@ def friendly_error(context: str, exc: Exception | None = None) -> str:
 
 
 def is_mongo_unreachable(exc: BaseException) -> bool:
-    """True for Atlas/network selection timeouts (not app bugs)."""
+    """True for Atlas/network issues and closed-client races (not app bugs)."""
     name = type(exc).__name__
-    if name in ("ServerSelectionTimeoutError", "NetworkTimeout", "AutoReconnect"):
+    if name in (
+        "ServerSelectionTimeoutError",
+        "NetworkTimeout",
+        "AutoReconnect",
+        "ConnectionFailure",
+        "InvalidOperation",
+    ):
         return True
     msg = str(exc).lower()
-    return "server selection timeout" in msg or "timed out" in msg and "mongodb" in msg
+    if "after close" in msg:
+        return True
+    if "server selection timeout" in msg:
+        return True
+    if "timed out" in msg and "mongo" in msg:
+        return True
+    return False
 

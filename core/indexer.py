@@ -4,6 +4,7 @@ Runs in-process (management bot event loop). Progress kept in INDEX_PROGRESS.
 """
 
 from __future__ import annotations
+from core.message_iter import custom_iter_messages
 
 import asyncio
 import logging
@@ -139,9 +140,14 @@ async def run_indexing(
             INDEX_PROGRESS.pop(user_id, None)
             return
 
-        BATCH = 100
         try:
-            while current < end_id:
+            async for message in custom_iter_messages(
+                bot_client,
+                source_chat_id,
+                limit=end_id,
+                offset=current,
+                batch_size=100,
+            ):
                 if INDEX_CANCEL.get(user_id):
                     INDEX_PROGRESS[user_id]["status"] = "cancelled"
                     break
@@ -155,67 +161,37 @@ async def run_indexing(
                     break
 
                 INDEX_PROGRESS[user_id]["status"] = "running"
-                batch_end = min(current + BATCH, end_id)
-                ids = list(range(current + 1, batch_end + 1))
-                if not ids:
-                    break
+                INDEX_PROGRESS[user_id]["processed"] = INDEX_PROGRESS[user_id].get("processed", 0) + 1
 
+                if message is None or getattr(message, "empty", False):
+                    INDEX_PROGRESS[user_id]["skipped"] += 1
+                    continue
+                extracted = _extract_media(message)
+                if not extracted:
+                    INDEX_PROGRESS[user_id]["skipped"] += 1
+                    continue
+                media_type, media = extracted
+                caption = message.caption or getattr(media, "file_name", None)
                 try:
-                    messages = await bot_client.get_messages(source_chat_id, ids)
-                except FloodWait as e:
-                    wait = int(getattr(e, "value", 5)) + 1
-                    await asyncio.sleep(wait)
-                    continue
-                except RPCError as e:
-                    logger.warning("get_messages error: %s", e)
-                    INDEX_PROGRESS[user_id]["errors"] += len(ids)
-                    current = batch_end
-                    continue
-                except Exception:
-                    logger.exception("get_messages failed")
-                    INDEX_PROGRESS[user_id]["errors"] += len(ids)
-                    current = batch_end
-                    continue
-
-                if not isinstance(messages, list):
-                    messages = [messages]
-
-                for message in messages:
-                    if INDEX_CANCEL.get(user_id):
-                        break
-                    INDEX_PROGRESS[user_id]["processed"] += 1
-                    if message is None or getattr(message, "empty", False):
-                        INDEX_PROGRESS[user_id]["skipped"] += 1
-                        continue
-                    extracted = _extract_media(message)
-                    if not extracted:
-                        INDEX_PROGRESS[user_id]["skipped"] += 1
-                        continue
-                    media_type, media = extracted
-                    caption = message.caption or getattr(media, "file_name", None)
-                    try:
-                        result = await save_indexed_media(
-                            user_id=user_id,
-                            index_bot_id=index_bot_id,
-                            source_chat_id=source_chat_id,
-                            source_message_id=message.id,
-                            media_type=media_type,
-                            file_id=media.file_id,
-                            file_unique_id=media.file_unique_id,
-                            caption=caption,
-                        )
-                        if result == "suc":
-                            INDEX_PROGRESS[user_id]["indexed"] += 1
-                        elif result == "dup":
-                            INDEX_PROGRESS[user_id]["duplicates"] += 1
-                        else:
-                            INDEX_PROGRESS[user_id]["errors"] += 1
-                    except Exception:
+                    result = await save_indexed_media(
+                        user_id=user_id,
+                        index_bot_id=index_bot_id,
+                        source_chat_id=source_chat_id,
+                        source_message_id=message.id,
+                        media_type=media_type,
+                        file_id=media.file_id,
+                        file_unique_id=media.file_unique_id,
+                        caption=caption,
+                    )
+                    if result == "suc":
+                        INDEX_PROGRESS[user_id]["indexed"] += 1
+                    elif result == "dup":
+                        INDEX_PROGRESS[user_id]["duplicates"] += 1
+                    else:
                         INDEX_PROGRESS[user_id]["errors"] += 1
-                        logger.exception("save_indexed_media")
-
-                current = batch_end
-                await asyncio.sleep(0.05)
+                except Exception:
+                    INDEX_PROGRESS[user_id]["errors"] += 1
+                    logger.exception("save_indexed_media")
 
             p = INDEX_PROGRESS.get(user_id) or {}
             elapsed = time.time() - start

@@ -256,7 +256,7 @@ async def jobs_log_refresh_loop(app: Client):
                 logger.warning("jobs_log: MongoDB unreachable — reconnect + backoff")
                 try:
                     from database import db
-                    await db.reconnect()
+                    await db.ensure_connected()
                 except Exception:
                     pass
                 await asyncio.sleep(30)

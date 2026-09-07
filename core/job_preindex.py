@@ -22,6 +22,7 @@ from database import (
     get_job,
 )
 from core.filters import get_unique_file_id
+from core.message_iter import custom_iter_messages, latest_message_id_probe
 
 logger = logging.getLogger(__name__)
 
@@ -130,46 +131,134 @@ async def _latest_id_user(client: Client, chat_id: int) -> int:
     return 0
 
 
+async def _resolve_target_chat(client: Client, chat_id: int) -> int:
+    """Force selected bot/account to resolve peer (required for private channels)."""
+    try:
+        chat = await client.get_chat(chat_id)
+        return int(getattr(chat, "id", chat_id) or chat_id)
+    except FloodWait as e:
+        await _sleep_flood(e)
+        chat = await client.get_chat(chat_id)
+        return int(getattr(chat, "id", chat_id) or chat_id)
+    except Exception as e:
+        raise RuntimeError(
+            f"Selected bot/account cannot access target `{chat_id}`: {type(e).__name__}: {e}. "
+            "Add this exact bot as admin in the target (with read messages), then retry."
+        ) from e
+
+
+async def _bot_probe_latest_id(client: Client, chat_id: int) -> int:
+    """Discover last message id for bots (no GetHistory).
+
+    1) Send a short marker message in the target
+    2) That message's id is the current last id
+    3) Delete the marker immediately
+
+    Requires the selected Forward Bot to be admin with Post + Delete in target.
+    Works independently for each target chat.
+    """
+    marker = "🔍"  # short; deleted right away
+    sent = None
+    try:
+        sent = await client.send_message(chat_id, marker)
+        latest = int(getattr(sent, "id", 0) or 0)
+        if latest <= 0:
+            raise RuntimeError("send_message returned no id")
+        logger.info(
+            "bot last-id probe chat=%s marker_id=%s (will delete)",
+            chat_id,
+            latest,
+        )
+        return latest
+    except FloodWait as e:
+        await _sleep_flood(e)
+        sent = await client.send_message(chat_id, marker)
+        latest = int(getattr(sent, "id", 0) or 0)
+        if latest <= 0:
+            raise RuntimeError("send_message returned no id after FloodWait")
+        return latest
+    except Exception as e:
+        raise RuntimeError(
+            f"Cannot probe last message id in target `{chat_id}`: {type(e).__name__}: {e}. "
+            "Selected Forward Bot must be admin with Post Messages permission."
+        ) from e
+    finally:
+        if sent is not None and getattr(sent, "id", None):
+            try:
+                await client.delete_messages(chat_id, sent.id)
+            except FloodWait as e:
+                try:
+                    await _sleep_flood(e)
+                    await client.delete_messages(chat_id, sent.id)
+                except Exception:
+                    logger.warning(
+                        "Could not delete probe msg %s in %s", sent.id, chat_id
+                    )
+            except Exception:
+                logger.warning(
+                    "Could not delete probe msg %s in %s",
+                    getattr(sent, "id", None),
+                    chat_id,
+                )
+
+
 async def _iter_bot_id_walk(
     client: Client,
     chat_id: int,
     on_progress=None,
 ) -> AsyncIterator[Any]:
-    """Always used for method=bot. Walks message ids downward."""
-    latest = await _latest_id_via_probe(client, chat_id)
+    """Bot pre-index — Index-Forward style:
+
+    * Discover last id by send → read id → delete (bot-safe)
+    * Walk 1..last with custom_iter_messages only (get_messages batches)
+    * No get_chat_history, no search_messages, no user-account assist
+
+    Each target is probed separately (multi-target safe).
+    """
+    chat_id = await _resolve_target_chat(client, int(chat_id))
+
+    from core.message_iter import custom_iter_messages
+
+    latest = await _bot_probe_latest_id(client, chat_id)
+    # Marker is deleted; its id is still the high-water for existing history
+    # (new posts after this use higher ids — fine for pre-index snapshot).
+
     if latest <= 0:
-        return
+        raise RuntimeError(
+            f"Selected bot got invalid last id for target `{chat_id}`."
+        )
+
     if on_progress:
         await on_progress(scanned=0, total=latest, phase="probe_done")
-    cur = latest
-    scanned = 0
-    while cur >= 1:
-        start = max(1, cur - PROBE_BATCH + 1)
-        ids = list(range(start, cur + 1))
-        try:
-            msgs = await client.get_messages(chat_id, ids)
-        except FloodWait as e:
-            await _sleep_flood(e)
-            continue
-        except Exception as e:
-            logger.warning("bot get_messages %s @%s: %s", chat_id, cur, e)
-            scanned += len(ids)
-            if on_progress:
-                await on_progress(scanned=scanned, total=latest, phase="walk")
-            cur = start - 1
-            continue
-        if not isinstance(msgs, list):
-            msgs = [msgs]
-        for m in sorted(
-            (x for x in msgs if x and not getattr(x, "empty", False)),
-            key=lambda x: x.id,
-            reverse=True,
-        ):
-            yield m
-        scanned += len(ids)
+
+    async def _batch(scanned, total):
         if on_progress:
-            await on_progress(scanned=scanned, total=latest, phase="walk")
-        cur = start - 1
+            await on_progress(scanned=scanned, total=total, phase="walk")
+
+    saw = 0
+    # Walk up to latest-1 so we skip the deleted marker id if it left a hole;
+    # include latest in range anyway — empty placeholder is fine.
+    async for message in custom_iter_messages(
+        client,
+        chat_id,
+        limit=latest,
+        offset=0,
+        batch_size=100,
+        on_batch=_batch,
+    ):
+        if message is None or getattr(message, "empty", False):
+            continue
+        saw += 1
+        yield message
+
+    if on_progress:
+        await on_progress(scanned=latest, total=latest, phase="walk_done")
+    logger.info(
+        "bot pre-index chat=%s custom_iter_messages non-empty=%s last_id=%s",
+        chat_id,
+        saw,
+        latest,
+    )
 
 
 async def _iter_user_history(
@@ -219,6 +308,7 @@ async def _iter_user_history(
             yield message
 
 
+
 async def preindex_job_targets(
     client: Client,
     user_id: int,
@@ -262,17 +352,40 @@ async def preindex_job_targets(
     except Exception:
         pass
 
+    # Identify executor (selected forward bot / user account client)
+    try:
+        me = await client.get_me()
+        logger.info(
+            "Pre-index job=%s using client id=%s username=@%s method=%s targets=%s",
+            job_id,
+            getattr(me, "id", None),
+            getattr(me, "username", None),
+            method,
+            targets,
+        )
+    except Exception:
+        logger.info("Pre-index job=%s method=%s targets=%s (get_me failed)", job_id, method, targets)
+
     total_ids = 0
     pending: List[dict] = []
     last_progress_ts = 0.0
+    messages_seen = 0
 
     async def _flush():
         nonlocal total_ids, pending
         if not pending:
             return
-        n = await bulk_mark_job_preindex(job_id, pending)
-        total_ids += n
+        chunk = list(pending)
         pending = []
+        n = await bulk_mark_job_preindex(job_id, chunk)
+        # Count every media id we attempted (not only Mongo upserted_count)
+        total_ids += len(chunk) if n >= 0 else 0
+        if n == 0 and chunk:
+            logger.warning(
+                "Pre-index bulk_mark returned 0 for %s items (job=%s) — check Mongo index",
+                len(chunk),
+                job_id,
+            )
 
     async def _write_progress(
         *,
@@ -358,6 +471,7 @@ async def preindex_job_targets(
                         await _flush()
                         return False, "Job paused during pre-index", total_ids
 
+                messages_seen += 1
                 uid = get_unique_file_id(message)
                 scanned_local += 1
                 if uid:
@@ -379,10 +493,27 @@ async def preindex_job_targets(
                     )
 
             await _flush()
+
             # Target complete
             await _write_progress(
                 target_i=ti + 1, scanned=0, total=0, target_id=tid, force=True
             )
+
+        logger.info(
+            "Pre-index job=%s method=%s done: messages_seen=%s media_ids=%s targets=%s",
+            job_id,
+            method,
+            messages_seen,
+            total_ids,
+            n_t,
+        )
+        note = None
+        if total_ids == 0:
+            note = (
+                f"0 media IDs (scanned non-empty msgs≈{messages_seen}). "
+                "Target may have no media, or bot cannot read media in that chat."
+            )
+            logger.warning("Pre-index job=%s %s", job_id, note)
 
         await update_job(
             user_id,
@@ -392,7 +523,8 @@ async def preindex_job_targets(
                 "pre_index_count": total_ids,
                 "pre_index_progress_pct": 100,
                 "pre_index_remaining": 0,
-                "pre_index_error": None,
+                "pre_index_error": note,
+                "pre_index_messages_seen": int(messages_seen),
                 "pre_index_target_done": n_t,
                 "pre_index_target_total": n_t,
             },

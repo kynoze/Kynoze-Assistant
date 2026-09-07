@@ -283,7 +283,12 @@ async def progress_ui_refresh_loop(app: Client):
         except Exception as e:
             from core.errors import is_mongo_unreachable
             if is_mongo_unreachable(e):
-                logger.warning("progress_ui: MongoDB unreachable — backoff 90s")
+                logger.warning("progress_ui: MongoDB unreachable — ensure + backoff 90s")
+                try:
+                    from database import db
+                    await db.ensure_connected()
+                except Exception:
+                    pass
                 await asyncio.sleep(90)
                 continue
             logger.exception("progress_ui_refresh_loop")
@@ -326,12 +331,12 @@ async def job_worker_loop(_management_client=None):
             from core.errors import is_mongo_unreachable
             if is_mongo_unreachable(e):
                 logger.warning(
-                    "Job worker: MongoDB unreachable — reconnect + backoff (%s)",
+                    "Job worker: MongoDB unreachable — ensure_connected + backoff (%s)",
                     type(e).__name__,
                 )
                 try:
                     from database import db
-                    await db.reconnect()
+                    await db.ensure_connected()
                 except Exception:
                     pass
                 await asyncio.sleep(30)
@@ -344,13 +349,7 @@ async def get_bot_client(bot_doc: dict) -> Optional[Client]:
     bot_id = bot_doc["bot_id"]
     # Management bot = main app client
     if bot_id == "__mgmt__" or bot_doc.get("is_mgmt"):
-        try:
-            from core.log_chat import get_mgmt_bot
-            c = get_mgmt_bot()
-            if c:
-                return c
-        except Exception:
-            pass
+        logger.error("Management Bot cannot be used for Jobs — select a Forward Bot")
         return None
 
     cached = CLIENTS.get(f"bot:{bot_id}")
@@ -634,7 +633,12 @@ async def run_single_job(job: dict):
             return
 
         # ── Pre-Index Target Duplicates (optional, before any forward) ──
-        if bool(job.get("pre_index_target_duplicates")) and job.get("pre_index_status") != "done":
+        # Re-run if never done, or finished with 0 IDs (likely failed silently before)
+        _need_pre = bool(job.get("pre_index_target_duplicates")) and (
+            job.get("pre_index_status") != "done"
+            or int(job.get("pre_index_count") or 0) == 0
+        )
+        if _need_pre:
             from core.job_preindex import preindex_job_targets
             logger.info("Job %s pre-indexing target media…", job_id)
             ok, msg, count = await preindex_job_targets(client, user_id, job)

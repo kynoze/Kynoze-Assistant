@@ -42,6 +42,7 @@ from database import is_job_preindex_duplicate, mark_job_preindex_id
 from core.filters import get_unique_file_id
 from core.caption import build_inline_keyboard, process_caption
 from core.filters import should_process_message
+from core.message_iter import custom_iter_messages
 
 logger = logging.getLogger(__name__)
 
@@ -133,52 +134,6 @@ async def _edit_progress(
     except Exception:
         pass
 
-
-async def custom_iter_messages(
-    client: Client,
-    chat_id: Union[int, str],
-    limit: int,
-    offset: int = 0,
-) -> AsyncGenerator[Message, None]:
-    """
-    Iterate message IDs (offset+1) .. limit inclusive.
-    Batch errors are logged and the batch is skipped (not the whole job).
-    """
-    current = offset
-    consecutive_failures = 0
-    while current < limit:
-        batch_size = min(200, limit - current)
-        message_ids = list(range(current + 1, current + batch_size + 1))
-        try:
-            messages = await client.get_messages(chat_id, message_ids)
-            consecutive_failures = 0
-        except FloodWait as e:
-            await asyncio.sleep(int(e.value) + 1)
-            continue
-        except Exception as e:
-            consecutive_failures += 1
-            logger.exception(
-                "get_messages failed at id~%s (failure %s): %s",
-                current + 1,
-                consecutive_failures,
-                e,
-            )
-            # Skip this batch so one bad window does not kill the whole job
-            current += batch_size
-            if consecutive_failures >= 5:
-                logger.error("Too many get_messages failures — stopping iteration")
-                return
-            await asyncio.sleep(0.5)
-            continue
-
-        if not isinstance(messages, list):
-            messages = [messages]
-
-        for msg in messages:
-            current += 1
-            if msg is None:
-                continue
-            yield msg
 
 
 async def _send_text(
